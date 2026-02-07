@@ -1,18 +1,3 @@
-; current goals or problems
-;second line doesn't print
-;setting up a static display of the file contents -> editor
-
-
-
-
-
-
-
-
-
-
-
-
 IDEAL
 MODEL small
 STACK 100h
@@ -21,14 +6,14 @@ DATASEG
 	filename db 64
 			db ?
 			db 64 dup (?)
-	headername db 65 dup (?)
 	emptyname db 'you entered nothing...$'
 	erroropening db 'there was an error while opening the file did you perhaps enter the wrong name?$'
 	filehandle dw ?
 	readres db 4096 dup (?)
 	lengthr dw ?
-	header db 'Alon`s File Editor - Current File: $'
-	currentrow db ?
+; --------------------------
+; Your variables here
+; --------------------------
 CODESEG	
 proc getFile
 	mov dx, offset msg ;user prompt
@@ -63,7 +48,6 @@ proc checkfile
 	mov [filehandle], ax
 	jmp endcheckfile
 	
-	; -- error msg printing --
 	erroropen:
 		mov dx, offset erroropening
 		mov ah, 9h
@@ -78,113 +62,29 @@ proc checkfile
 endp
 proc readfile
 
-    mov ah,3Fh                ; read file
-    mov bx, [filehandle]
-    mov cx, 4096
-    mov dx,offset readres
-    int 21h
-    mov [lengthr], ax         ; save number of bytes read
-
-    ; --- Clear screen ---
-    mov ah, 0
-    mov al, 3                 ; 80x25 text mode
-    int 10h
-
-    ; --- Set up video memory ---
-    mov ax, 0B800h
-    mov es, ax
-    xor di, di                ; DI = offset in screen memory
-    xor bx, bx                ; BX = current column (0..79)
-    xor dx, dx                ; DX = current row (0..24)
-
-	mov dx, offset header
+	mov ah,3Fh                ;read file
+	mov bx, [filehandle]
+	mov cx, 4096
+	mov dx,offset readres
+	int 21h
+	mov [lengthr], ax
+	
+	mov bx, offset readres ; add $ at the end of the buffer
+	add bx, [lengthr]
+	mov [byte ptr bx], '$'
+	mov dx, offset readres
 	mov ah, 9h
 	int 21h
 	
-	lea bx, [filename]
-	add bl, [bx+1]        ; length
-	mov [byte ptr bx+2], '$'
-	
-	mov dx, offset filename
-	add dx, 2
-	mov ah, 9h
-	int 21h
-	
-	lea bx, [filename]
-	add bl, [bx+1]        ; length
-	mov [byte ptr bx+2], 0
-	xor bx, bx               
-    xor dx, dx  
-	xor di,di ; set column to 0
-    add di, 160                ; move to next row
-	inc dx	; row++
-	
-    mov si, offset readres
-    mov cx, [lengthr]
-	mov [currentrow], 1
-   
+	ret
 
-display_loop:
-    lodsb                     ; AL = next character
-
-    cmp al, 0
-    je next_char              ; skip null bytes
-
-    cmp al, 0Dh               ; CR
-    je handle_cr
-
-    cmp al, 0Ah               ; LF
-    je handle_lf
-
-    ; --- Normal character ---
-    mov ah, 07h               ; text attribute
-    mov [es:di], al           ; character
-    mov [es:di+1], ah         ; attribute
-    add di, 2
-    inc bx                     ; next column
-
-    cmp bx, 80
-    jb next_char               ; still within line
-    jmp handle_lf
-	
-handle_cr:
-	xor di,di ; set column to 0
-	mov al, 160
-	mul [currentrow]
-	mov di, ax
-	inc [currentrow]
-    inc dx	; row++
-    cmp dx, 25
-    jb next_char
-    jmp done_display
-
-handle_lf:
-    jb next_char
-    jmp done_display
-
-next_char:
-    loop display_loop
-    jmp done_display
-
-done_display:
-    ; --- Reset cursor to top-left ---
-    mov ah, 02h
-    mov bh, 0
-    xor dh, dh
-    xor dl, dl
-    int 10h
-	
-	mov ah, 00h
-	int 16h
-	
-    ret
-endp
+endp 
 start:
 	mov ax, @data
 	mov ds, ax
 	
 	mov ah, 0 ;clear screen
-	mov al, 3
+	mov al, 2
 	int 10h
 	
 	call getFile
@@ -195,6 +95,9 @@ start:
 	int 21h
 	
 	call readfile
+; --------------------------
+; Your code here
+; --------------------------
 	
 exit:
 	mov ax, 4c00h
