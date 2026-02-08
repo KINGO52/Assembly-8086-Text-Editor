@@ -1,14 +1,6 @@
 ; current goals or problems
-;second line doesn't print
-;setting up a static display of the file contents -> editor
-
-
-
-
-
-
-
-
+;adding editing functionality
+;saving the buffer into the file as well as saving into a temp file on every edit
 
 
 
@@ -29,7 +21,15 @@ DATASEG
 	lengthr dw ?
 	header db 'Alon`s File Editor - Current File: $'
 	currentrow db ?
+	cursrow db ?
+	curscol db ?
 CODESEG	
+macro goto_pos row, col
+    mov ah, 02h
+    mov dh, [&row]
+    mov dl, [&col]
+    int 10h
+endm
 proc getFile
 	mov dx, offset msg ;user prompt
 	mov ah, 9h
@@ -145,22 +145,25 @@ display_loop:
 
     cmp bx, 80
     jb next_char               ; still within line
-    jmp handle_lf
+    jmp handle_cr              ; wrap line (same as carriage return)
 	
 handle_cr:
+	xor bx, bx                ; reset column counter
+	inc [currentrow]
 	xor di,di ; set column to 0
 	mov al, 160
 	mul [currentrow]
 	mov di, ax
-	inc [currentrow]
+	
     inc dx	; row++
     cmp dx, 25
     jb next_char
     jmp done_display
 
 handle_lf:
-    jb next_char
-    jmp done_display
+	cmp bx, 0                 ; check if at start of line
+    je next_char              ; if column 0, CR already moved us - skip LF
+    jmp handle_cr             ; otherwise treat LF as line break (LF-only files)
 
 next_char:
     loop display_loop
@@ -169,32 +172,107 @@ next_char:
 done_display:
     ; --- Reset cursor to top-left ---
     mov ah, 02h
-    mov bh, 0
-    xor dh, dh
+    xor bh, bh
+    mov dh, 1
     xor dl, dl
     int 10h
 	
-	mov ah, 00h
-	int 16h
-	
+    ret
+endp
+proc main_loop
+    mov ah, 0 ;clear screen
+    mov al, 3
+    int 10h
+    
+    call getFile
+    call checkfile
+    
+    mov dl, 0ah
+    mov ah, 2h
+    int 21h
+    
+    call readfile
+	mov [cursrow], 2
+	mov [curscol], 1
+
+    mov dh, 1      ; start at row 1
+    mov dl, 0      ; start at column 0
+    
+    read_key:
+    mov ah, 00h
+    int 16h        ; wait for key
+
+    cmp ah, 48h
+    je up_arrow
+    cmp ah, 50h
+    je down_arrow
+    cmp ah, 4Bh
+    je left_arrow
+    cmp ah, 4Dh
+    je right_arrow
+	cmp al, 13h
+	jne read_key
+	jmp quit
+    ; Normal key (ASCII in AL)
+    jmp read_key
+
+
+    jmp read_key
+    
+    up_arrow:
+        cmp dh, 1
+        je read_key
+		dec [cursrow]
+        goto_pos cursrow,curscol
+        jmp read_key
+    down_arrow:
+        cmp dh, 24
+        je read_key
+        inc [cursrow]
+        goto_pos cursrow,curscol
+        jmp read_key
+    left_arrow:
+        cmp dl, 0
+        je up_arrow2
+        dec [curscol]
+        goto_pos cursrow,curscol
+        jmp read_key
+	up_arrow2:
+        cmp dh, 1
+        je read_key
+		dec [cursrow]
+		mov [curscol], 79
+        goto_pos cursrow,curscol
+        jmp read_key
+    right_arrow:
+        cmp dl, 79
+        je down_arrow2
+        inc [curscol]
+        goto_pos cursrow,curscol
+        jmp read_key
+	down_arrow2:
+		cmp dh, 24
+        je down_arrow
+        inc [cursrow]
+        goto_pos cursrow,0
+        jmp read_key
+	quit:
+		mov [cursrow], 0
+		mov [curscol], 0
+		goto_pos cursrow,curscol
+		
     ret
 endp
 start:
 	mov ax, @data
 	mov ds, ax
 	
-	mov ah, 0 ;clear screen
-	mov al, 3
-	int 10h
-	
-	call getFile
-	call checkfile
-	
-	mov dl, 0ah
-	mov ah, 2h
-	int 21h
-	
-	call readfile
+	call main_loop
+	;mov ah, 02h
+    ;xor bh, bh
+    ;mov dh, 1
+    ;xor dl, dl
+    ;int 10h
 	
 exit:
 	mov ax, 4c00h
