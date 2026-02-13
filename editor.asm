@@ -3,8 +3,7 @@
 ;saving the buffer into the file as well as saving into a temp file on every edit
 
 
-
-
+JUMPS
 IDEAL
 MODEL small
 STACK 100h
@@ -26,8 +25,8 @@ DATASEG
 CODESEG	
 macro goto_pos row, col
     mov ah, 02h
-    mov dh, [&row]
-    mov dl, [&col]
+    mov dh, [row]
+    mov dl, [col]
     int 10h
 endm
 proc getFile
@@ -110,9 +109,11 @@ proc readfile
 	mov ah, 9h
 	int 21h
 	
-	lea bx, [filename]
+	lea bx, [filename]					;Re-add ASCIIZ termination
 	add bl, [bx+1]        ; length
 	mov [byte ptr bx+2], 0
+	
+	
 	xor bx, bx               
     xor dx, dx  
 	xor di,di ; set column to 0
@@ -186,14 +187,15 @@ proc main_loop
     
     call getFile
     call checkfile
+	
     
     mov dl, 0ah
     mov ah, 2h
     int 21h
     
     call readfile
-	mov [cursrow], 2
-	mov [curscol], 1
+	mov [cursrow], 1
+	mov [curscol], 0
 
     mov dh, 1      ; start at row 1
     mov dl, 0      ; start at column 0
@@ -201,27 +203,29 @@ proc main_loop
     read_key:
     mov ah, 00h
     int 16h        ; wait for key
-
-    cmp ah, 48h
-    je up_arrow
-    cmp ah, 50h
-    je down_arrow
-    cmp ah, 4Bh
-    je left_arrow
-    cmp ah, 4Dh
-    je right_arrow
-	cmp al, 13h
-	jne read_key
-	jmp quit
-    ; Normal key (ASCII in AL)
-    jmp read_key
+	
+	
+	
+	special keys:
+		cmp ah, 48h
+		je up_arrow
+		cmp ah, 50h
+		je down_arrow
+		cmp ah, 4Bh
+		je left_arrow
+		cmp ah, 4Dh
+		je right_arrow
+		cmp al, 13h
+		jne read_key
+		jmp quit
+    
 
 
     jmp read_key
     
     up_arrow:
-        cmp dh, 1
-        je read_key
+        cmp dh, 2
+        jb read_key
 		dec [cursrow]
         goto_pos cursrow,curscol
         jmp read_key
@@ -233,30 +237,35 @@ proc main_loop
         jmp read_key
     left_arrow:
         cmp dl, 0
-        je up_arrow2
-        dec [curscol]
-        goto_pos cursrow,curscol
-        jmp read_key
-	up_arrow2:
-        cmp dh, 1
-        je read_key
+        ja notup
+		cmp dh, 1
+		je read_key
 		dec [cursrow]
 		mov [curscol], 79
+		goto_pos cursrow, curscol
+		jmp read_key
+		notup:
+        dec [curscol]
         goto_pos cursrow,curscol
         jmp read_key
     right_arrow:
         cmp dl, 79
-        je down_arrow2
+        jb notdown
+		cmp dh, 24
+		je read_key
+		inc [cursrow]
+		mov [curscol], 0
+		goto_pos cursrow, curscol
+		jmp read_key
+		notdown:
         inc [curscol]
         goto_pos cursrow,curscol
         jmp read_key
-	down_arrow2:
-		cmp dh, 24
-        je down_arrow
-        inc [cursrow]
-        goto_pos cursrow,0
-        jmp read_key
+		
 	quit:
+		mov ah, 0 ;clear screen
+		mov al, 3
+		int 10h
 		mov [cursrow], 0
 		mov [curscol], 0
 		goto_pos cursrow,curscol
