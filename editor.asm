@@ -52,6 +52,7 @@ DATASEG
 	lengthr dw ?
 	header db 'Alon`s File Editor - Current File: $'
 	char_location dw ? ; location to use for video memory
+	crlf_str db 0Dh, 0Ah
 CODESEG	
 macro goto_pos row, col
     mov ah, 02h
@@ -347,6 +348,86 @@ proc readfile
     ret
 endp
 
+proc save_file
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    ; Create/Truncate file to clear existing contents
+    mov ah, 3Ch
+    mov cx, 0                   ; normal file attribute
+    mov dx, offset filename+2
+    int 21h
+    jc save_done                ; exit if error
+    mov [filehandle], ax
+
+    xor cx, cx                  ; CX = current line index
+save_loop:
+    cmp cx, [line_count]
+    jae save_done
+
+    mov bx, cx
+    shl bx, 1
+    mov dx, [line_lengths + bx] ; DX = length of current line
+
+    cmp dx, 0
+    je write_newline            ; skip writing chars if line is empty
+
+    ; Calculate start of line in 'lines' buffer
+    mov ax, MAX_LINELEN
+    push dx                     ; save length
+    mul cx                      ; AX = cx * MAX_LINELEN
+    add ax, offset lines
+    pop dx                      ; restore length in DX
+    
+    ; Write line characters
+    push cx                     ; save line index
+    mov cx, dx                  ; CX = number of bytes to write
+    mov dx, ax                  ; DX = address of buffer
+    mov ah, 40h                 ; write to file
+    mov bx, [filehandle]
+    int 21h
+    pop cx                      ; restore line index
+
+write_newline:
+    ; Don't write newline after the last line
+    mov ax, cx
+    inc ax
+    cmp ax, [line_count]
+    jae next_line
+
+    ; Write CRLF
+    mov ah, 40h
+    mov bx, [filehandle]
+    push cx                     ; save line index
+    mov cx, 2                   ; write 2 bytes
+    mov dx, offset crlf_str
+    int 21h
+    pop cx                      ; restore line index
+
+next_line:
+    inc cx
+    jmp save_loop
+
+save_done:
+    ; Close the file
+    mov ah, 3Eh
+    mov bx, [filehandle]
+    int 21h
+
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    ret
+endp
+
+
 ; ============================================================
 ; render_screen
 ; Renders the editor content from the lines buffer to video memory.
@@ -509,12 +590,30 @@ proc main_loop
 			je left_arrow
 			cmp ah, 4Dh
 			je right_arrow
+			cmp ah, 47h
+			je home
+			cmp ah, 4Fh
+			je endkey
 			jmp read_key
+	home:
+			mov [cur_col], 0
+			call update_cursor
+			jmp read_key
+	endkey:
+		push bx
+		mov bx, [cur_line]
+		shl bx, 1
+		add bx, offset line_lengths
+		movm2m [cur_col], [bx]
+		pop bx
+		call update_cursor
+		jmp read_key
+		
 	handle_backspace:
 		cmp [cur_col], 0
-		je left_arrow             ; Can't backspace if already at the start of the line
+		je backspace_start_of_line
 		
-		dec [cur_col]             ; Move left to point to the character to be deleted
+		dec [cur_col]             ; Move left to point to the deleted char
 
 		push ax
 		push bx
@@ -523,87 +622,77 @@ proc main_loop
 		push si
 		push di
 
-		; 1. Calculate how many characters need to be shifted left
+		; 1. Calculate chars to shift left
 		mov bx, [cur_line]
 		shl bx, 1
 		mov cx, [line_lengths + bx]
-		
 		mov ax, [cur_col]
 		sub cx, ax
-		dec cx                  ; CX = chars to shift = line_length - cur_col - 1
-
-		; Base offset for the character being deleted in 'lines' array
+		dec cx                  ; CX = line_lengths - cur_col - 1
+		
 		mov ax, [cur_line]
-		mov dx, 80
-		mul dx                  ; AX = cur_line * 80 (DX is clobbered to 0)
+		mov dx, MAX_LINELEN
+		mul dx
 		add ax, [cur_col]
-		mov si, ax              ; SI = destination index within 'lines'
-
-		; 2. Functionally shift characters in the internal buffer
+		add ax, offset lines
+		mov di, ax              ; DI = dest (deleted char)
+		mov si, ax
+		inc si                  ; SI = src (char after deleted)
+		
 		cmp cx, 0
-		jle clear_func          ; Skip shifting if we're deleting at the end of the line
+		jle skip_bs_shift
 
+		; Shift characters left functionally
 		push cx
-		push si
-		mov di, si              ; DI = dest
-		inc si                  ; SI = src (one character to the right)
-		add si, offset lines
-		add di, offset lines
-	shift_func_loop:
-		mov al, [si]
-		mov [di], al
-		inc si
-		inc di
-		loop shift_func_loop
-		pop si
+		push es
+		mov ax, ds
+		mov es, ax
+		cld
+		rep movsb
+		pop es
 		pop cx
 
-	clear_func:
-		; Write space at the end of the valid text to clear the trailing char
-		mov bx, si
-		cmp cx, 0
-		jl skip_add_cx
-		add bx, cx              ; BX points to the last shifted char
-	skip_add_cx:
-		add bx, offset lines
-		mov [byte ptr bx], ' '  
+	skip_bs_shift:
+		; Blank the final char location (DI naturally increments to the gap)
+		mov [byte ptr di], ' '
 
-		; Update line length
+		; Decrement line length
 		mov bx, [cur_line]
 		shl bx, 1
 		dec [word ptr line_lengths + bx]
 
-		; 3. Visually shift characters on the screen
+		; 2. Visually shift left and redraw
 		mov ax, 0B800h
 		mov es, ax
+		
 		mov ax, [cur_line]
 		mov dx, 160
 		mul dx
 		add ax, 160             ; Skip header row
 		
 		mov bx, [cur_col]
-		shl bx, 1               ; Two bytes per column
-		add ax, bx              
-		mov di, ax              ; DI = destination in video memory
+		shl bx, 1
+		add ax, bx
+		mov di, ax              ; DI = video dest
 		mov si, ax
-		add si, 2               ; SI = source (next character)
-
+		add si, 2               ; SI = video src
+		
 		cmp cx, 0
-		jle clear_vis
-
+		jle skip_vis_bs_shift
+		
 		push cx
-	shift_vis_loop:
-		mov al, [es:si]         ; Read char
-		mov [es:di], al         ; Write char
-		mov al, [es:si+1]       ; Read attribute
-		mov [es:di+1], al       ; Write attribute
+	vis_bs_shift_loop:
+		mov al, [es:si]
+		mov [es:di], al
+		mov al, [es:si+1]
+		mov [es:di+1], al
 		add si, 2
 		add di, 2
-		loop shift_vis_loop
+		loop vis_bs_shift_loop
 		pop cx
-
-	clear_vis:
-		; Write space visually
+		
+	skip_vis_bs_shift:
+		; Blank the last visual char
 		mov [byte ptr es:di], ' '
 		mov [byte ptr es:di+1], 07h
 
@@ -615,6 +704,159 @@ proc main_loop
 		pop ax
 		
 		call update_cursor
+		jmp read_key
+
+	backspace_start_of_line:
+		cmp [cur_line], 0
+		je backspace_ignore        ; line 0 col 0 do nothing
+
+		; Get length of prev line
+		mov bx, [cur_line]
+		dec bx
+		shl bx, 1
+		mov ax, [line_lengths + bx]
+		mov cx, ax                 ; CX = length of prev line
+		
+		; Get length of current line
+		mov bx, [cur_line]
+		shl bx, 1
+		mov ax, [line_lengths + bx] ; AX = length of current line
+		
+		; Check if combination exceeds MAX_LINELEN
+		push ax
+		add ax, cx
+		cmp ax, MAX_LINELEN
+		pop ax
+		ja backspace_ignore        ; Too long to join
+		
+		; Set new cur_col to end of prev line before joining
+		mov [cur_col], cx
+
+		; Copy chars from current line to previous line
+		cmp ax, 0
+		je join_empty_line         ; Nothing to copy
+
+		push cx                    ; save prev len
+		push ax                    ; save current len
+
+		; Source: lines[cur_line * MAX_LINELEN]
+		mov ax, [cur_line]
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, offset lines
+		mov si, ax
+
+		; Dest: lines[(cur_line - 1) * MAX_LINELEN + prev_len]
+		mov ax, [cur_line]
+		dec ax
+		mov dx, MAX_LINELEN
+		mul dx
+		pop dx                     ; restore current len into dx
+		pop cx                     ; restore prev len into cx
+		add ax, cx
+		add ax, offset lines
+		mov di, ax
+
+		push cx
+		push dx
+		
+		mov cx, dx
+		mov ax, ds
+		mov es, ax
+		rep movsb
+
+		pop dx
+		pop cx
+
+	join_empty_line:
+		; Update prev line length
+		mov bx, [cur_line]
+		dec bx
+		shl bx, 1
+		mov ax, cx
+		add ax, dx
+		mov [line_lengths + bx], ax
+
+		; Shift subsequent lines UP
+		mov ax, [cur_line]
+		inc ax
+		mov cx, [line_count]
+		sub cx, ax
+		jle update_line_count_bs   ; If no lines below, skip shift
+
+		; Shift line_lengths array
+		mov bx, [cur_line]
+		shl bx, 1
+		add bx, offset line_lengths
+		mov di, bx
+		mov si, bx
+		add si, 2
+
+		push cx
+	shift_lengths_up_loop:
+		mov ax, [si]
+		mov [di], ax
+		add si, 2
+		add di, 2
+		loop shift_lengths_up_loop
+		pop cx
+
+		; Shift text lines UP
+		mov ax, [cur_line]
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, offset lines
+		mov di, ax
+		mov si, ax
+		add si, MAX_LINELEN
+		
+		mov ax, ds
+		mov es, ax
+
+	shift_text_up_loop:
+		push cx
+		push si
+		push di
+		
+		mov cx, MAX_LINELEN / 2
+		rep movsw
+		
+		pop di
+		pop si
+		pop cx
+		add si, MAX_LINELEN
+		add di, MAX_LINELEN
+		loop shift_text_up_loop
+
+	update_line_count_bs:
+		dec [line_count]
+
+		; Clear the last line that was shifted
+		mov ax, [line_count]
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, offset lines
+		mov di, ax
+		mov cx, MAX_LINELEN / 2
+		xor ax, ax
+		rep stosw
+
+		; Update cur_line
+		dec [cur_line]
+
+		; Scroll adjust if cur_line is above viewport
+		mov ax, [scroll_offset]
+		cmp [cur_line], ax
+		jae redraw_screen_bs
+		mov ax, [cur_line]
+		mov [scroll_offset], ax
+
+	redraw_screen_bs:
+		call render_screen
+		call update_cursor
+		jmp read_key
+
+	backspace_ignore:
 		jmp read_key
 
 	handle_enter:
@@ -727,7 +969,7 @@ proc main_loop
 	copy_split_loop:
 		mov al, [si]
 		mov [di], al
-		mov byte ptr [si], 0 ; Clear old char
+		mov [byte ptr si], 0 ; Clear old char
 		inc si
 		inc di
 		loop copy_split_loop
@@ -755,45 +997,119 @@ proc main_loop
 		jmp read_key
 		
 	normal:
-
 		push cx
 		push bx
 		push ax
+		push si
+		push di
 		
-		mov ax, 0B800h
-		mov es, ax
-		mov ax,[cur_line] ; edit array for the chars
-		mov bx, [cur_col]
-		mov cx, 80
-		mul cx 
-		add ax, bx
-		mov [char_location], ax ; save location to update screen
-		mov bx, ax
-		pop ax
-		push ax
-		add bx, offset lines
-		mov [byte ptr bx], al
-		mov ax, [char_location]
-		mov cx, 2
-		mul cx
-		add ax, 160
-		mov di, ax
-		pop ax
-		mov cx , 07h
-		mov [es:di], al
 		mov bx, [cur_line]
-		shl bx, 1                 ; multiply by 2
+		shl bx, 1
 		mov cx, [line_lengths+bx]
-		cmp [cur_col],cx
-		jb in_line
-		inc [word ptr bx + line_lengths]
-		in_line:
-		inc [cur_col]
-		call update_cursor_pos
-		pop bx
+		
+		; Ensure we don't exceed MAX_LINELEN
+		cmp cx, MAX_LINELEN
+		jae normal_done_full
+		
+		inc [word ptr line_lengths+bx] ; increment the line length
+
+		; Calculate offset of the end of the current line
+		mov ax, [cur_line]
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, cx             ; CX is the old line length
+		add ax, offset lines
+		mov di, ax             ; DI points to end of line + 1 (where the last char should move)
+		mov si, ax
+		dec si                 ; SI points to the last actual char of the line
+		
+		mov dx, cx             ; DX = old line length
+		sub dx, [cur_col]      ; DX = number of chars to shift
+		
+		cmp dx, 0
+		jle skip_func_shift    ; if cur_col >= old line length, no shifting needed
+
+		push cx                ; save line length
+		mov cx, dx             ; CX = count to shift
+		
+		; Shift chars right (functionally)
+		; Need to iterate backwards so rep movsb requires STD
+		push es
+		mov ax, ds
+		mov es, ax
+		std
+		rep movsb
+		cld
+		pop es
 		pop cx
 		
-	
+	skip_func_shift:
+		; Insert the new char functionally
+		mov ax, [cur_line]
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, [cur_col]
+		add ax, offset lines
+		mov bx, ax
+		
+		; Retrieve the character to insert from stack
+		; Stack: si, di, ax, bx, cx -> ax is [sp+4]
+		mov bp, sp
+		mov al, [bp+4] 
+		mov [byte ptr bx], al
+		
+		; Visually redraw the rest of the line from cur_col onwards
+		mov ax, 0B800h
+		mov es, ax
+		
+		mov ax, [cur_line]
+		mov dx, 160
+		mul dx
+		add ax, 160             ; Skip header row
+		mov bx, [cur_col]
+		shl bx, 1
+		add ax, bx
+		mov di, ax              ; DI = video memory destination
+		
+		mov ax, [cur_line]
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, [cur_col]
+		add ax, offset lines
+		mov si, ax              ; SI = lines array source
+
+		; Calculate how many characters to redraw: (old line length + 1) - cur_col
+		mov cx, dx              ; DX has old len - cur_col ?? Wait no, let's recalculate
+		mov bx, [cur_line]
+		shl bx, 1
+		mov cx, [line_lengths+bx] ; CX = new line length
+		sub cx, [cur_col]       ; CX = number of chars to redraw
+		
+	redraw_vis_loop:
+		mov al, [si]
+		mov [es:di], al
+		mov [byte ptr es:di+1], 07h
+		inc si
+		add di, 2
+		loop redraw_vis_loop
+
+	normal_done:
+		inc [cur_col]
+		pop di
+		pop si
+		pop ax
+		pop bx
+		pop cx
+		jmp update_cursor_pos
+
+	normal_done_full:
+		pop di
+		pop si
+		pop ax
+		pop bx
+		pop cx
+		jmp read_key
+		
 	special_keys:
 		cmp ah, 48h
 		je up_arrow
@@ -963,6 +1279,7 @@ cursor_right_of_viewport:
 		jmp read_key
 		
 	quit:
+		call save_file
 		; clear screen
 		mov ah, 0
 		mov al, 3
