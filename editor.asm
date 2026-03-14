@@ -142,7 +142,7 @@ proc parse_readres_into_lines
     mov si, offset readres        ; SI = read pointer (never clobbered below)
     mov cx, [lengthr]             ; CX = bytes remaining (decremented every lodsb)
 
-    or cx, cx
+    or cx, cx ;if cx=0 then the flag that is checked with jz is 0 therefore the file is empty so we go to init_empty_line
     jz parse_done
 
 parse_char:
@@ -273,6 +273,8 @@ mark_loop:
     mov bx, cx
     shl bx, 1
     mov bx, [line_lengths+bx]    ; BX = length of this line
+	cmp bx, MAX_LINELEN
+	jae skip_mark_write
 
     ; target = lines + (cx * MAX_LINELEN) + BX
     push bx                       ; save length
@@ -284,7 +286,7 @@ mark_loop:
 
     mov bx, ax
     mov [bx], dl                  ; write marker (0Ah or 0)
-
+	skip_mark_write:
     inc cx
     jmp mark_loop
 
@@ -528,6 +530,10 @@ proc update_cursor
 	
 	; Column is directly from cur_col
 	mov dx, [cur_col]
+	cmp dl, 79
+	jbe col_ok
+	mov dl, 79
+col_ok:
 	
 	mov dh, al ; save screen row
 	
@@ -593,23 +599,23 @@ proc main_loop
 			cmp ah, 47h
 			je home
 			cmp ah, 4Fh
-			je endkey
+			je end_key
 			jmp read_key
 	home:
 			mov [cur_col], 0
 			call update_cursor
 			jmp read_key
-	endkey:
+	end_key:
 		push bx
 		mov bx, [cur_line]
 		shl bx, 1
 		add bx, offset line_lengths
 		cmp [word ptr bx], 80
-		jl normalend
+		jl normal_end
 		mov [cur_col], 79
 		call update_cursor
 		jmp read_key
-		normalend:
+		normal_end:
 			movm2m [cur_col], [bx]
 			pop bx
 			call update_cursor
