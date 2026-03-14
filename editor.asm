@@ -512,47 +512,108 @@ proc main_loop
 		cmp [cur_col], 0
 		je left_arrow             ; Can't backspace if already at the start of the line
 		
-		dec [cur_col]           ; Move left to point to the character to be deleted
+		dec [cur_col]             ; Move left to point to the character to be deleted
 
 		push ax
 		push bx
 		push cx
+		push dx
+		push si
+		push di
 
-		; 1. Calculate the byte offset in the 'lines' buffer
-		mov ax, [cur_line]
-		mov bx, [cur_col]
-		mov cx, 80
-		mul cx 
-		add ax, bx              ; AX = offset within 'lines' array
-		mov [char_location], ax ; Save it for video memory calculation
-
-		; 2. Clear the character in the internal buffer
-		mov bx, ax
-		add bx, offset lines
-		mov [byte ptr bx], ' '  ; Set to space (ASCII 20h)
-
-		; 3. Clear the character visually on the screen
-		mov ax, 0B800h
-		mov es, ax
-		mov ax, [char_location]
-		mov cx, 2
-		mul cx
-		add ax, 160             ; Skip the 80 characters of the header (row 0)
-		mov di, ax
-		mov [byte ptr es:di], ' '   ; Write space character
-		mov [byte ptr es:di+1], 07h ; Set normal attribute (light gray)
-
-		; 4. Update the line length count
+		; 1. Calculate how many characters need to be shifted left
 		mov bx, [cur_line]
-		shl bx, 1               ; Word index (BX * 2)
+		shl bx, 1
+		mov cx, [line_lengths + bx]
+		
+		mov ax, [cur_col]
+		sub cx, ax
+		dec cx                  ; CX = chars to shift = line_length - cur_col - 1
+
+		; Base offset for the character being deleted in 'lines' array
+		mov ax, [cur_line]
+		mov dx, 80
+		mul dx                  ; AX = cur_line * 80 (DX is clobbered to 0)
+		add ax, [cur_col]
+		mov si, ax              ; SI = destination index within 'lines'
+
+		; 2. Functionally shift characters in the internal buffer
+		cmp cx, 0
+		jle clear_func          ; Skip shifting if we're deleting at the end of the line
+
+		push cx
+		push si
+		mov di, si              ; DI = dest
+		inc si                  ; SI = src (one character to the right)
+		add si, offset lines
+		add di, offset lines
+	shift_func_loop:
+		mov al, [si]
+		mov [di], al
+		inc si
+		inc di
+		loop shift_func_loop
+		pop si
+		pop cx
+
+	clear_func:
+		; Write space at the end of the valid text to clear the trailing char
+		mov bx, si
+		cmp cx, 0
+		jl skip_add_cx
+		add bx, cx              ; BX points to the last shifted char
+	skip_add_cx:
+		add bx, offset lines
+		mov [byte ptr bx], ' '  
+
+		; Update line length
+		mov bx, [cur_line]
+		shl bx, 1
 		dec [word ptr line_lengths + bx]
 
+		; 3. Visually shift characters on the screen
+		mov ax, 0B800h
+		mov es, ax
+		mov ax, [cur_line]
+		mov dx, 160
+		mul dx
+		add ax, 160             ; Skip header row
+		
+		mov bx, [cur_col]
+		shl bx, 1               ; Two bytes per column
+		add ax, bx              
+		mov di, ax              ; DI = destination in video memory
+		mov si, ax
+		add si, 2               ; SI = source (next character)
+
+		cmp cx, 0
+		jle clear_vis
+
+		push cx
+	shift_vis_loop:
+		mov al, [es:si]         ; Read char
+		mov [es:di], al         ; Write char
+		mov al, [es:si+1]       ; Read attribute
+		mov [es:di+1], al       ; Write attribute
+		add si, 2
+		add di, 2
+		loop shift_vis_loop
+		pop cx
+
+	clear_vis:
+		; Write space visually
+		mov [byte ptr es:di], ' '
+		mov [byte ptr es:di+1], 07h
+
+		pop di
+		pop si
+		pop dx
 		pop cx
 		pop bx
 		pop ax
 		
-		call update_cursor      ; Refresh the hardware cursor position
-		jmp read_key            ; Wait for the next input
+		call update_cursor
+		jmp read_key
 		
 	normal:
 
