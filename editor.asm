@@ -59,7 +59,7 @@ macro goto_pos row, col
     mov dl, col
     int 10h
 endm
-macro movm2m op1, op2
+macro movm2m op1, op2 ; mov command compatible with memory to memory
 	push ax
 	mov ax, op2
 	mov op1, ax
@@ -488,6 +488,8 @@ proc main_loop
 		je handle_extended
 		cmp al, 08h    ; AL = 08h → backspace ASCII
 		je handle_backspace
+		cmp al, 0Dh    ; Enter key ASCII
+		je handle_enter
 		cmp al, 1Bh
 		je quit
 		cmp al, 13h
@@ -613,6 +615,143 @@ proc main_loop
 		pop ax
 		
 		call update_cursor
+		jmp read_key
+
+	handle_enter:
+		mov ax, [line_count]
+		cmp ax, MAX_LINES
+		jae enter_done
+
+		mov cx, [line_count]
+		sub cx, [cur_line]
+		dec cx
+		jl split_current_line_only
+		jz split_current_line_only
+
+		; Shift line_lengths array
+		mov bx, [line_count]
+		dec bx
+		shl bx, 1
+		add bx, offset line_lengths
+		
+		push cx
+	shift_lengths_loop:
+		mov ax, [bx]
+		mov [bx + 2], ax
+		sub bx, 2
+		loop shift_lengths_loop
+		pop cx
+
+		; Shift text lines
+		mov ax, [line_count]
+		dec ax
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, offset lines
+		mov si, ax
+		mov di, ax
+		add di, MAX_LINELEN
+
+		mov ax, ds
+		mov es, ax  ; ensure es=ds for rep movsw
+		
+	shift_text_lines_loop:
+		push cx
+		push si
+		push di
+		
+		mov cx, MAX_LINELEN / 2
+		rep movsw
+		
+		pop di
+		pop si
+		pop cx
+		sub si, MAX_LINELEN
+		sub di, MAX_LINELEN
+		loop shift_text_lines_loop
+
+	split_current_line_only:
+		mov ax, ds
+		mov es, ax
+
+		; Clear the new line (cur_line + 1)
+		mov ax, [cur_line]
+		inc ax
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, offset lines
+		mov di, ax
+		mov cx, MAX_LINELEN / 2
+		xor ax, ax
+		rep stosw       ; clears MAX_LINELEN bytes at new line with 0
+
+		mov bx, [cur_line]
+		shl bx, 1
+		mov cx, [line_lengths + bx]
+		sub cx, [cur_col]
+
+		mov ax, cx
+		cmp ax, 0
+		jge set_new_length
+		xor ax, ax
+		mov cx, 0
+	set_new_length:
+		mov bx, [cur_line]
+		inc bx
+		shl bx, 1
+		mov [line_lengths + bx], ax
+
+		mov ax, [cur_col]
+		mov bx, [cur_line]
+		shl bx, 1
+		mov [line_lengths + bx], ax
+
+		cmp cx, 0
+		jle finalize_enter
+
+		; Copy Characters
+		mov ax, [cur_line]
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, [cur_col]
+		add ax, offset lines
+		mov si, ax
+
+		mov ax, [cur_line]
+		inc ax
+		mov dx, MAX_LINELEN
+		mul dx
+		add ax, offset lines
+		mov di, ax
+
+	copy_split_loop:
+		mov al, [si]
+		mov [di], al
+		mov byte ptr [si], 0 ; Clear old char
+		inc si
+		inc di
+		loop copy_split_loop
+
+	finalize_enter:
+		inc [line_count]
+		inc [cur_line]
+		mov [cur_col], 0
+
+		mov ax, [scroll_offset]
+		add ax, 23
+		cmp [cur_line], ax
+		ja scroll_down_ent
+		call render_screen
+		jmp read_key_enter_done
+
+	scroll_down_ent:
+		inc [scroll_offset]
+		call render_screen
+	read_key_enter_done:
+		call update_cursor
+		jmp read_key
+
+	enter_done:
 		jmp read_key
 		
 	normal:
