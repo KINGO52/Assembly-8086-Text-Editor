@@ -59,6 +59,12 @@ macro goto_pos row, col
     mov dl, col
     int 10h
 endm
+macro movm2m op1, op2
+	push ax
+	mov ax, op2
+	mov op1, ax
+	pop ax
+endm
 proc getFile
 	mov dx, offset msg ;user prompt
 	mov ah, 9h
@@ -503,42 +509,50 @@ proc main_loop
 			je right_arrow
 			jmp read_key
 	handle_backspace:
-		mov ax, 0
-		push cx
-		push bx
-		push ax
+		cmp [cur_col], 0
+		je left_arrow             ; Can't backspace if already at the start of the line
 		
-		mov ax, 0B800h
-		mov es, ax
-		mov ax,[cur_line] ; edit array for the chars
+		dec [cur_col]           ; Move left to point to the character to be deleted
+
+		push ax
+		push bx
+		push cx
+
+		; 1. Calculate the byte offset in the 'lines' buffer
+		mov ax, [cur_line]
 		mov bx, [cur_col]
 		mov cx, 80
 		mul cx 
-		add ax, bx
-		mov [char_location], ax ; save location to update screen
+		add ax, bx              ; AX = offset within 'lines' array
+		mov [char_location], ax ; Save it for video memory calculation
+
+		; 2. Clear the character in the internal buffer
 		mov bx, ax
-		pop ax
-		push ax
 		add bx, offset lines
-		mov [byte ptr bx], al
+		mov [byte ptr bx], ' '  ; Set to space (ASCII 20h)
+
+		; 3. Clear the character visually on the screen
+		mov ax, 0B800h
+		mov es, ax
 		mov ax, [char_location]
 		mov cx, 2
 		mul cx
-		add ax, 160
+		add ax, 160             ; Skip the 80 characters of the header (row 0)
 		mov di, ax
-		pop ax
-		mov cx , 07h
-		mov [es:di], al
+		mov [byte ptr es:di], ' '   ; Write space character
+		mov [byte ptr es:di+1], 07h ; Set normal attribute (light gray)
+
+		; 4. Update the line length count
 		mov bx, [cur_line]
-		shl bx, 1                 ; multiply by 2
-		mov cx, [line_lengths+bx]
-		cmp [cur_col],cx
-		jne in_lineb ;b = backspace (special label for the backspace case)
-		dec [word ptr bx + line_lengths]
-		in_lineb:
-		pop bx
+		shl bx, 1               ; Word index (BX * 2)
+		dec [word ptr line_lengths + bx]
+
 		pop cx
-		jmp left_arrow
+		pop bx
+		pop ax
+		
+		call update_cursor      ; Refresh the hardware cursor position
+		jmp read_key            ; Wait for the next input
 		
 	normal:
 
@@ -673,28 +687,49 @@ proc main_loop
         ja notup
 		cmp [cur_line], 0
 		je read_key
+		;; move to previous line ;;
+		
+		;calculate the end of the previous line
+		;/=======================\;
 		dec [cur_line]
-		mov ax, [line_lengths]
-		add ax, ax
-		mov bx, ax
-		mov bx, [line_lengths+bx]
-		mov [cur_col], bx
+		mov bx, offset line_lengths
+		push [cur_line]
+		shl [cur_line], 1 ;multiply (shift bits left by one) for word-array indexing
+		add bx, [cur_line] ;add the offset to get the address of the line length for the needed line
+		;\=======================/;
+		movm2m [cur_col], [bx] 		;set column to the end of the previous line
+		pop [cur_line] ;restore line value to the correct one
 		jmp update_cursor_pos
-		notup:
+
+		;; case for just moving left ;;
+    notup:
         dec [cur_col]
 		jmp update_cursor_pos
 		
     right_arrow:
-        ; Get current line length
-        mov ax, [cur_line]
-        shl ax, 1 ; multiply by 2 (shift all bits left by one)
-        mov bx, ax
-        mov ax, [line_lengths+bx]
-		dec ax
+        ; 1. Get current line length
+        mov bx, [cur_line]
+        shl bx, 1
+        mov ax, [line_lengths + bx]
+
+        ; 2. Check if we are at the end of the current line
         cmp [cur_col], ax
-        ja read_key
-		inc [cur_col]
-		jmp update_cursor_pos
+        jb move_right_same_line
+
+        ; 3. If at the end, try to wrap to the next line
+        mov ax, [line_count]
+        dec ax
+        cmp [cur_line], ax
+        jae read_key             ; Already at the last line, nowhere to go right
+
+        ;; Move to start of next line ;;
+        inc [cur_line]
+        mov [cur_col], 0
+        jmp update_cursor_pos
+
+    move_right_same_line:
+        inc [cur_col]
+        jmp update_cursor_pos
 		
 update_cursor_pos:
 		; Check if need to scroll
