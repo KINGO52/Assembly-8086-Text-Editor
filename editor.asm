@@ -494,13 +494,13 @@ header_name_done:
 	mov dl, 0Ah
 	int 21h
 	
-	
-	mov bx,  MAX_LINELEN * 23
-	add bx, offset lines
-	mov [byte ptr bx], '$'
-	mov ah, 09h
+	; render the file contents
+	mov ah, 40h
+	mov bx, 1          ; STDOUT (screen)
+	mov cx, MAX_LINELEN * 23
 	mov dx, offset lines
 	int 21h
+
 	
 	call update_cursor
 	
@@ -604,10 +604,16 @@ proc main_loop
 		mov bx, [cur_line]
 		shl bx, 1
 		add bx, offset line_lengths
-		movm2m [cur_col], [bx]
-		pop bx
+		cmp [word ptr bx], 80
+		jl normalend
+		mov [cur_col], 79
 		call update_cursor
 		jmp read_key
+		normalend:
+			movm2m [cur_col], [bx]
+			pop bx
+			call update_cursor
+			jmp read_key
 		
 	handle_backspace:
 		cmp [cur_col], 0
