@@ -60,10 +60,9 @@ Requires **TASM** and **TLINK** (Turbo Assembler).
 TASM editor.asm
 TLINK editor.obj
 ```
+If you want there is a relases page with pre-built versions https://github.com/KINGO52/Assembly-8086-Text-Editor/releases
 
 Run `EDITOR.EXE` in a DOS environment (DOSBox recommended).
-
-If you want there is a relases page with pre-built versions
 ---
 
 ## Project Structure
