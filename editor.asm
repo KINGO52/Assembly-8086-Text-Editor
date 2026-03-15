@@ -1,105 +1,138 @@
-; current goals or problems
-;adding editing functionality
-;saving the buffer into the file as well as saving into a temp file on every edit
-
+; ==============================================================
+; editor.asm  --  8086 Text Editor
+; ==============================================================
+; Ongoing work:
+;   - Finding and patching bugs in the code
+;   - Auto-save every AUTOSAVE_LIMIT edits to a temp file
+; ==============================================================
 
 JUMPS
 IDEAL
 MODEL small
 STACK 100h
 DATASEG
-	; --- DATA MODEL CONSTANTS ---
-	MAX_LINES     equ 200         ; Max number of lines in the buffer
-	MAX_LINELEN   equ 80          ; Max characters per line
+	; ---- Data-model constants -----------------------------------------------
+	MAX_LINES     equ 200         ; Maximum number of lines held in the buffer
+	MAX_LINELEN   equ 80          ; Maximum characters per line (columns 0-79)
 
-
-	; --- CORE BUFFER ---
-	; Raw storage for all lines, laid out contiguously.
-	; Address of line 'i' = offset lines + (i * MAX_LINELEN)
+	; ---- Core text buffer ---------------------------------------------------
+	; Lines are stored contiguously.  Address of line i:
+	;   offset lines + (i * MAX_LINELEN)
 	lines         db MAX_LINES * MAX_LINELEN dup(0)
 
-	; Array to store the actual length of each line.
+	; Actual character count for each line (word array, 0-based).
 	line_lengths  dw MAX_LINES dup(0)
 
-	; Current number of lines loaded in the buffer.
+	; Number of lines currently loaded in the buffer.
 	line_count    dw 0
 
-	; --- EDITOR STATE ---
-	; Cursor position within the buffer.
-	cur_line      dw 0            ; Current line index (0-based)
-	cur_col       dw 0            ; Current column index (0-based)
+	; ---- Editor state -------------------------------------------------------
+	cur_line      dw 0            ; Cursor: current line index (0-based)
+	cur_col       dw 0            ; Cursor: current column index (0-based)
 
-	; Viewport state.
-	scroll_offset dw 0            ; Buffer line index displayed at the top of the screen (row 1).
+	; Index of the buffer line shown on screen row 1 (top of viewport).
+	scroll_offset dw 0
 
-	; File state.
-	file_dirty    db 0            ; Flag (1 if modified, 0 otherwise)
-	edit_counter  db 0            ; Counter for autosave feature
-	AUTOSAVE_LIMIT equ 10         ; Number of edits before triggering an autosave
+	; ---- File / save state --------------------------------------------------
+	file_dirty    db 0            ; 1 = buffer has unsaved changes, 0 = clean
+	edit_counter  db 0            ; Counts edits since the last autosave
+	AUTOSAVE_LIMIT equ 10         ; Trigger autosave after this many edits
 
-	; Filename for temporary/backup file on save.
+	; Null-terminated path for the temporary/backup file written on each save.
 	temp_filename db 64 dup(0)
 
-	msg db 'Enter filname (including file extension) $'
-	filename db 64
-			db ?
-			db 64 dup (?)
-	headername db 65 dup (?)
-	emptyname db 'you entered nothing...$'
+	; ---- UI strings ---------------------------------------------------------
+	msg         db 'Enter filname (including file extension) $'
+	filename    db 64             ; DOS buffered-input max-length byte
+	            db ?              ; Actual length byte (filled by INT 21h / 0Ah)
+	            db 64 dup (?)     ; Character buffer
+	headername  db 65 dup (?)
+	emptyname   db 'you entered nothing...$'
 	erroropening db 'there was an error while opening the file did you perhaps enter the wrong name?$'
-	filehandle dw ?
-	readres db 4096 dup (?)
-	lengthr dw ?
-	header db 'Alon`s File Editor - Current File: $'
-	char_location dw ? ; location to use for video memory
-	crlf_str db 0Dh, 0Ah
-CODESEG	
+	filehandle  dw ?
+	readres     db 4096 dup (?)   ; Raw file read buffer (max 4 096 bytes)
+	lengthr     dw ?              ; Number of bytes returned by the last read
+	header      db 'Alon`s File Editor - Current File: $'
+	char_location dw ?            ; Video-memory offset used during rendering
+	crlf_str    db 0Dh, 0Ah      ; CRLF pair written between lines on save
+
+CODESEG
+
+; --------------------------------------------------------------
+; goto_pos row, col
+; Sets the hardware cursor to (row, col) via BIOS INT 10h / 02h.
+; Clobbers: AH, DH, DL  (caller must save if needed)
+; --------------------------------------------------------------
 macro goto_pos row, col
     mov ah, 02h
     mov dh, row
     mov dl, col
     int 10h
 endm
-macro movm2m op1, op2 ; mov command compatible with memory to memory
+
+; --------------------------------------------------------------
+; movm2m dst, src
+; Memory-to-memory move using AX as a temporary register.
+; Expands to three instructions; AX is restored after the copy.
+; --------------------------------------------------------------
+macro movm2m op1, op2
 	push ax
 	mov ax, op2
 	mov op1, ax
 	pop ax
 endm
+
+; ==============================================================
+; getFile
+; Prompts the user for a filename and reads it into the DOS
+; buffered-input structure at [filename] (INT 21h / 0Ah).
+; After return, [filename+1] holds the character count and
+; [filename+2] is the first character of the entered string.
+; ==============================================================
 proc getFile
-	mov dx, offset msg ;user prompt
+	mov dx, offset msg      ; point to the prompt string
 	mov ah, 9h
 	int 21h
-	
-	mov dx, offset filename ; user input for file
+
+	mov dx, offset filename ; hand the buffered-input block to DOS
 	mov bx, dx
 	mov ah, 0Ah
 	int 21h
-	
+
 	ret
 endp
+
+; ==============================================================
+; checkfile
+; Validates the filename entered by getFile and opens it for
+; reading.  On success, [filehandle] receives the DOS file
+; handle.  On failure the appropriate error message is printed.
+;
+; Registers modified: AX, BX, DX (all saved/restored internally)
+; ==============================================================
 proc checkfile
-	mov al, [filename+1]
+	mov al, [filename+1]    ; length byte written by INT 21h / 0Ah
 	cmp al, 0
-	je invalid_input
-	
-	; make the file name 0 terminated for I/O
+	je invalid_input        ; nothing was typed
+
+	; Build a null-terminated string for DOS file-open (INT 21h / 3Dh).
+	; The buffered-input layout is: [max][len][chars...], so
+	; terminator goes at chars[len] == filename+2+len.
 	lea bx, [filename]
-	add bl, [bx+1]        ; length
-	mov [byte ptr bx+2], 0
-	
-	
-	mov dx, offset filename+2  ; pointer to filename
-	mov al, 0                 ; access mode
+	add bl, [bx+1]          ; advance BL past the max and len bytes
+	mov [byte ptr bx+2], 0  ; write the null terminator
+
+	mov dx, offset filename+2  ; DS:DX = null-terminated filename
+	mov al, 0                  ; access mode: read-only
 	mov ah, 3Dh
 	int 21h
-	jc erroropen            ; CF=1 → error
+	jc erroropen               ; CF set means open failed
 
-	mov bx, ax                ; AX = file handle (save it!)
+	mov bx, ax                 ; save the handle returned in AX
 	mov [filehandle], ax
 	jmp endcheckfile
-	
-	; -- error msg printing --
+
+	; ---- Error paths --------------------------------------------------------
 	erroropen:
 		mov dx, offset erroropening
 		mov ah, 9h
@@ -113,21 +146,27 @@ proc checkfile
 		ret
 endp
 
-; ============================================================
+; ==============================================================
 ; parse_readres_into_lines
-; Parses raw file content from readres into the lines buffer.
-; Handles CR, LF, and CRLF line endings.
-; Updates line_count with the number of lines parsed.
-; ============================================================
-; ============================================================
-; parse_readres_into_lines
-; Fixes:
-;   - SI no longer clobbered during line/length writes (BX used as ptr)
-;   - CX properly decremented on every byte read
-;   - CRLF peek reads from current SI, not start of buffer
-;   - Dead handle_line_wrap removed
-;   - Spurious mul in line_lengths indexing removed
-; ============================================================
+;
+; Parses raw file content from [readres] (length in [lengthr])
+; into the lines[] buffer, populating line_lengths[] and
+; line_count.  Handles CR, LF, and CRLF line endings.
+;
+; Register map (preserved across the call):
+;   SI  = read pointer into readres (never aliased below)
+;   BX  = current line index (0-based)
+;   DI  = current column within the line (0-based)
+;   CX  = bytes remaining to consume
+;
+; Design notes:
+;   - BX is pushed/popped whenever it must temporarily hold a
+;     pointer so that SI is never clobbered.
+;   - Every byte consumed by lodsb is immediately followed by
+;     dec cx so the count stays accurate.
+;   - CRLF peek reads from the current SI position, not the
+;     start of the buffer.
+; ==============================================================
 proc parse_readres_into_lines
     push ax
     push bx
@@ -136,44 +175,44 @@ proc parse_readres_into_lines
     push si
     push di
 
-    xor bx, bx                    ; BX = line index (0-based)
+    xor bx, bx                    ; BX = line index (starts at 0)
     xor di, di                    ; DI = column offset within current line
 
     mov si, offset readres        ; SI = read pointer (never clobbered below)
-    mov cx, [lengthr]             ; CX = bytes remaining (decremented every lodsb)
+    mov cx, [lengthr]             ; CX = bytes remaining
 
-    or cx, cx ;if cx=0 then the flag that is checked with jz is 0 therefore the file is empty so we go to init_empty_line
-    jz parse_done
+    or cx, cx                     ; ZF set if file is empty
+    jz parse_done                 ; nothing to parse -- leave a zeroed buffer
 
 parse_char:
     or cx, cx
-    jz handle_eof                 ; stop when all bytes consumed
+    jz handle_eof                 ; all bytes consumed
 
     lodsb
-    dec cx                        ; FIX: count down every byte we consume
+    dec cx                        ; account for the byte lodsb just advanced SI over
 
     cmp al, 0
-    je parse_char                 ; skip null bytes
+    je parse_char                 ; ignore embedded null bytes in the raw data
 
-    cmp al, 0Dh                   ; CR
+    cmp al, 0Dh                   ; CR (Carriage Return)
     je handle_cr
 
-    cmp al, 0Ah                   ; LF
+    cmp al, 0Ah                   ; LF (Line Feed)
     je handle_lf
 
-    ; --- Regular character ---
+    ; ---- Regular character --------------------------------------------------
     cmp di, MAX_LINELEN
-    jae parse_char                ; line full, discard character
+    jae parse_char                ; line is full; discard the character silently
 
-    ; Store AL into lines[BX * MAX_LINELEN + DI]
-    ; BX is our line index - we need it as a ptr temporarily so push/pop it
+    ; Write AL into lines[BX * MAX_LINELEN + DI].
+    ; BX is the line index; borrow it as a pointer, then restore it.
     push bx
-    push ax                       ; save character (in AL)
+    push ax                       ; preserve character while computing address
     mov ax, MAX_LINELEN
     mul bx                        ; AX = line_index * MAX_LINELEN
-    add ax, di
-    add ax, offset lines
-    mov bx, ax                    ; BX = destination pointer
+    add ax, di                    ; + column offset
+    add ax, offset lines          ; + base of buffer
+    mov bx, ax                    ; BX = final destination pointer
     pop ax                        ; restore character into AL
     mov [bx], al
     pop bx                        ; restore line index
@@ -182,40 +221,40 @@ parse_char:
     jmp parse_char
 
 handle_cr:
-    ; Store line_lengths[BX] = DI
+    ; Commit the current line length and advance to the next line.
     push bx
     mov ax, bx
-    shl ax, 1                     ; AX = BX * 2 (word array index)
+    shl ax, 1                     ; word-array index (each entry is 2 bytes)
     add ax, offset line_lengths
     mov bx, ax
-    mov [bx], di                  ; FIX: uses BX as ptr, SI untouched
+    mov [bx], di                  ; line_lengths[line_index] = column count
     pop bx
 
     inc bx
     cmp bx, MAX_LINES
-    jae parse_done
-    xor di, di
+    jae parse_done                ; buffer is full; stop
+    xor di, di                    ; reset column for the new line
 
-    ; Peek at next byte to handle CRLF
+    ; Peek at the next byte to handle CRLF sequences.
     or cx, cx
     jz parse_done                 ; nothing left to peek at
     lodsb
-    dec cx                        ; FIX: count the peeked byte
-    cmp al, 0Ah                   ; is it LF?
-    je parse_char                 ; yes - consume it and move on
-    ; Not LF - put byte back (un-consume)
+    dec cx                        ; count the peeked byte
+    cmp al, 0Ah                   ; is the next byte LF?
+    je parse_char                 ; yes -- discard it and continue
+    ; Not LF: un-consume the peeked byte and process it next iteration.
     dec si
     inc cx
     jmp parse_char
 
 handle_lf:
-    ; Store line_lengths[BX] = DI
+    ; Stand-alone LF: same line-commit logic as CR.
     push bx
     mov ax, bx
     shl ax, 1
     add ax, offset line_lengths
     mov bx, ax
-    mov [bx], di                  ; FIX: uses BX as ptr, SI untouched
+    mov [bx], di
     pop bx
 
     inc bx
@@ -226,7 +265,8 @@ handle_lf:
 
 handle_eof:
 parse_done:
-    ; If final line has content, store its length and count it
+    ; If the final line has content that was never terminated by a newline,
+    ; store its length and include it in the count.
     cmp di, 0
     je store_count
 
@@ -250,43 +290,46 @@ store_count:
     pop ax
     ret
 endp
-; ============================================================
+
+; ==============================================================
 ; mark_line_endings
-; Writes 'marker' byte at position line_lengths[i] in each line,
-; i.e. the first null byte after each line's content.
-; Call with AL = 0Ah to mark, AL = 0 to unmark.
-; ============================================================
+;
+; Writes a marker byte at position line_lengths[i] in every line
+; (i.e. at the byte immediately after the last character).
+;   AL = 0Ah  -> mark  (used before raw video output)
+;   AL = 0    -> unmark (restores null terminator)
+; ==============================================================
 proc mark_line_endings
     push ax
     push bx
     push cx
     push dx
 
-    mov dl, al                    ; save marker byte
+    mov dl, al                    ; preserve marker byte; AL will be clobbered
     xor cx, cx                    ; CX = line index
 
 mark_loop:
     cmp cx, [line_count]
     jae mark_done
 
-    ; BX = line_lengths[cx] (word array so cx*2)
+    ; BX = line_lengths[cx]
     mov bx, cx
-    shl bx, 1
-    mov bx, [line_lengths+bx]    ; BX = length of this line
-	cmp bx, MAX_LINELEN
-	jae skip_mark_write
+    shl bx, 1                     ; word-array index
+    mov bx, [line_lengths+bx]     ; BX = length of this line
+    cmp bx, MAX_LINELEN
+    jae skip_mark_write           ; length at or beyond column limit; skip
 
-    ; target = lines + (cx * MAX_LINELEN) + BX
+    ; Compute: &lines[cx * MAX_LINELEN + BX]
     push bx                       ; save length
     mov ax, MAX_LINELEN
     mul cx                        ; AX = cx * MAX_LINELEN
     pop bx
-    add ax, bx                    ; AX = offset into line
-    add ax, offset lines          ; AX = final address
+    add ax, bx                    ; + column offset (= length)
+    add ax, offset lines          ; + buffer base
 
     mov bx, ax
-    mov [bx], dl                  ; write marker (0Ah or 0)
-	skip_mark_write:
+    mov [bx], dl                  ; write the marker byte
+    skip_mark_write:
     inc cx
     jmp mark_loop
 
@@ -297,59 +340,79 @@ mark_done:
     pop ax
     ret
 endp
+
+; ==============================================================
+; readfile
+;
+; Reads up to 4 096 bytes from [filehandle] into [readres],
+; then delegates parsing to parse_readres_into_lines.
+; Afterwards, the screen is cleared and the header is rendered.
+; Editor state (cur_line, cur_col, scroll_offset, dirty flag)
+; is reset to its initial values.
+; ==============================================================
 proc readfile
 
-    mov ah,3Fh                ; read file
+    mov ah, 3Fh               ; DOS: read from file handle
     mov bx, [filehandle]
-    mov cx, 4096
-    mov dx,offset readres
+    mov cx, 4096              ; maximum bytes to read
+    mov dx, offset readres
     int 21h
-    mov [lengthr], ax         ; save number of bytes read
+    mov [lengthr], ax         ; AX = bytes actually read
 
-    ; Parse raw file data into lines buffer
+    ; Break the raw bytes into individual lines.
     call parse_readres_into_lines
 
-    ; --- Clear screen ---
+    ; ---- Clear screen (mode 3 = 80x25 colour text) --------------------------
     mov ah, 0
-    mov al, 3                 ; 80x25 text mode
+    mov al, 3
     int 10h
 
-    ; --- Display header ---
-	mov dx, offset header
-	mov ah, 9h
-	int 21h
-	
-	lea bx, [filename]
-	add bl, [bx+1]        ; length
-	mov [byte ptr bx+2], '$'
-	
-	mov dx, offset filename
-	add dx, 2
-	mov ah, 9h
-	int 21h
-	
-	lea bx, [filename]
-	add bl, [bx+1]
-	mov [byte ptr bx+2], 0
-	
-    ; --- Reset editor state ---
+    ; ---- Render the "editor name + filename" header on row 0 ----------------
+    mov dx, offset header
+    mov ah, 9h
+    int 21h
+
+    ; Temporarily terminate the filename with '$' so INT 21h / 09h can print it.
+    lea bx, [filename]
+    add bl, [bx+1]            ; BL now points past the length byte
+    mov [byte ptr bx+2], '$'
+
+    mov dx, offset filename
+    add dx, 2                 ; skip max-len and actual-len bytes
+    mov ah, 9h
+    int 21h
+
+    ; Restore the null terminator so the filename remains ASCIIZ.
+    lea bx, [filename]
+    add bl, [bx+1]
+    mov [byte ptr bx+2], 0
+
+    ; ---- Reset all editor state to start-of-file ----------------------------
     xor ax, ax
     mov [cur_line], ax
     mov [cur_col], ax
     mov [scroll_offset], ax
     mov [file_dirty], al
     mov [edit_counter], al
-	
-    ; --- Reset cursor to start position ---
+
+    ; Place the hardware cursor at row 1, column 0 (below the header).
     mov ah, 02h
     xor bh, bh
     mov dh, 1
     xor dl, dl
     int 10h
-	
+
     ret
 endp
 
+; ==============================================================
+; save_file
+;
+; Writes the entire lines[] buffer back to disk, one line at a
+; time, separated by CRLF pairs.  No CRLF is written after the
+; final line.  The file is created/truncated by INT 21h / 3Ch
+; before writing begins.
+; ==============================================================
 proc save_file
     push ax
     push bx
@@ -358,54 +421,56 @@ proc save_file
     push si
     push di
 
-    ; Create/Truncate file to clear existing contents
+    ; Create (or truncate) the file so we always start with a clean slate.
     mov ah, 3Ch
-    mov cx, 0                   ; normal file attribute
+    mov cx, 0                   ; normal attribute (no read-only, hidden, etc.)
     mov dx, offset filename+2
     int 21h
-    jc save_done                ; exit if error
+    jc save_done                ; carry set = create failed; abort gracefully
     mov [filehandle], ax
 
     xor cx, cx                  ; CX = current line index
+
 save_loop:
     cmp cx, [line_count]
     jae save_done
 
+    ; Load this line's character count into DX.
     mov bx, cx
     shl bx, 1
-    mov dx, [line_lengths + bx] ; DX = length of current line
+    mov dx, [line_lengths + bx]
 
     cmp dx, 0
-    je write_newline            ; skip writing chars if line is empty
+    je write_newline            ; empty line: skip the write, still emit CRLF
 
-    ; Calculate start of line in 'lines' buffer
+    ; Compute the start address of the line in the buffer.
     mov ax, MAX_LINELEN
-    push dx                     ; save length
+    push dx                     ; save length across the multiply
     mul cx                      ; AX = cx * MAX_LINELEN
-    add ax, offset lines
-    pop dx                      ; restore length in DX
-    
-    ; Write line characters
-    push cx                     ; save line index
-    mov cx, dx                  ; CX = number of bytes to write
-    mov dx, ax                  ; DX = address of buffer
-    mov ah, 40h                 ; write to file
+    add ax, offset lines        ; AX = pointer to line data
+    pop dx                      ; restore length into DX
+
+    ; Write DX bytes starting at AX.
+    push cx                     ; preserve line index across INT 21h
+    mov cx, dx                  ; CX = byte count for the write call
+    mov dx, ax                  ; DX = data pointer
+    mov ah, 40h                 ; DOS: write to file handle
     mov bx, [filehandle]
     int 21h
     pop cx                      ; restore line index
 
 write_newline:
-    ; Don't write newline after the last line
+    ; Omit the trailing newline on the very last line.
     mov ax, cx
     inc ax
     cmp ax, [line_count]
     jae next_line
 
-    ; Write CRLF
+    ; Write the two-byte CRLF sequence.
     mov ah, 40h
     mov bx, [filehandle]
-    push cx                     ; save line index
-    mov cx, 2                   ; write 2 bytes
+    push cx                     ; preserve line index
+    mov cx, 2
     mov dx, offset crlf_str
     int 21h
     pop cx                      ; restore line index
@@ -415,7 +480,7 @@ next_line:
     jmp save_loop
 
 save_done:
-    ; Close the file
+    ; Close the file handle regardless of how we got here.
     mov ah, 3Eh
     mov bx, [filehandle]
     int 21h
@@ -430,12 +495,20 @@ save_done:
 endp
 
 
-; ============================================================
+; ==============================================================
 ; render_screen
-; Renders the editor content from the lines buffer to video memory.
-; Clears screen, draws header, and displays visible lines.
-; W.I.P currently does not work
-; ============================================================
+;
+; Redraws the entire visible area of the editor:
+;   1. Clears the display (BIOS mode-set).
+;   2. Writes the header (editor title + filename) to row 0
+;      directly via video memory (segment 0B800h).
+;   3. Dumps MAX_LINELEN * 23 bytes of the lines[] buffer to
+;      STDOUT so DOS renders them on rows 1-23.
+;   4. Calls update_cursor to place the hardware cursor.
+;
+; Note: the raw-buffer dump in step 3 is a work-in-progress;
+; it does not yet honour scroll_offset.
+; ==============================================================
 proc render_screen
 	push ax
 	push bx
@@ -443,40 +516,39 @@ proc render_screen
 	push dx
 	push si
 	push di
-	
-	; --- Clear screen (rows 0-24) ---
+
+	; ---- Clear display ------------------------------------------------------
 	mov ah, 0
-	mov al, 3
+	mov al, 3                 ; 80x25 colour text mode
 	int 10h
-	
-	; --- Set up video memory ---
+
+	; ---- Set up video segment -----------------------------------------------
 	mov ax, 0B800h
 	mov es, ax
-	xor di, di
-	
-	; --- Draw header on row 0 ---
+	xor di, di                ; start writing from video offset 0 (row 0, col 0)
+
+	; ---- Render the header string on row 0 ----------------------------------
 	mov si, offset header
-	mov ah, 07h              ; attribute
-	xor di, di               ; Start at video offset 0
-	
+	mov ah, 07h               ; attribute: white on black
+
 header_loop:
 	lodsb
-	cmp al, '$'
+	cmp al, '$'               ; '$' is the DOS string terminator
 	je header_done
-	mov [es:di], al
-	mov [es:di+1], ah
-	add di, 2
+	mov [es:di], al           ; character byte
+	mov [es:di+1], ah         ; attribute byte
+	add di, 2                 ; each screen cell is 2 bytes
 	jmp header_loop
-	
+
 header_done:
-	; Add filename to header
+	; Append the actual filename to the header row.
 	lea bx, [filename]
-	add bl, [bx+1]
-	mov [byte ptr bx+2], '$'
-	
+	add bl, [bx+1]            ; point past the length byte
+	mov [byte ptr bx+2], '$'  ; temporarily terminate with '$'
+
 	mov si, offset filename
-	add si, 2
-	
+	add si, 2                 ; skip the max-len and actual-len prefix bytes
+
 header_name_loop:
 	lodsb
 	cmp al, '$'
@@ -485,27 +557,28 @@ header_name_loop:
 	mov [es:di+1], ah
 	add di, 2
 	jmp header_name_loop
-	
+
 header_name_done:
-	; Restore ASCIIZ
+	; Restore the ASCIIZ null terminator that was replaced above.
 	lea bx, [filename]
 	add bl, [bx+1]
 	mov [byte ptr bx+2], 0
-	
+
+	; Emit a line-feed so subsequent DOS output starts on row 1.
 	mov ah, 02h
 	mov dl, 0Ah
 	int 21h
-	
-	; render the file contents
+
+	; ---- Dump lines buffer to screen (rows 1-23) ----------------------------
+	; TODO: render only the lines visible through scroll_offset.
 	mov ah, 40h
-	mov bx, 1          ; STDOUT (screen)
-	mov cx, MAX_LINELEN * 23
+	mov bx, 1                 ; handle 1 = STDOUT
+	mov cx, MAX_LINELEN * 23  ; bytes to write (23 visible content rows)
 	mov dx, offset lines
 	int 21h
 
-	
 	call update_cursor
-	
+
 	pop di
 	pop si
 	pop dx
@@ -515,79 +588,93 @@ header_name_done:
 	ret
 endp
 
-; ============================================================
+; ==============================================================
 ; update_cursor
-; Positions the hardware cursor based on cur_line, cur_col, scroll_offset.
-; ============================================================
+;
+; Positions the hardware cursor to match the logical editor
+; position: screen row = cur_line - scroll_offset + 1,
+; screen column = cur_col (clamped to 79).
+; ==============================================================
 proc update_cursor
 	push ax
-	
-	; Calculate screen row: cur_line - scroll_offset + 1
+
+	; Compute: screen_row = cur_line - scroll_offset + 1
 	mov ax, [cur_line]
 	sub ax, [scroll_offset]
-	inc ax
-	
-	
-	; Column is directly from cur_col
+	inc ax                    ; row 0 is the header; content starts at row 1
+
+	; Clamp the column to the visible range (0-79).
 	mov dx, [cur_col]
 	cmp dl, 79
 	jbe col_ok
 	mov dl, 79
 col_ok:
-	
-	mov dh, al ; save screen row
-	
-	; Set cursor position
-	mov ah, 02h
-	xor bh, bh
+	mov dh, al                ; DH = screen row, DL = screen column
+
+	mov ah, 02h               ; BIOS: set cursor position
+	xor bh, bh                ; page 0
 	int 10h
-	
+
 	pop ax
 	ret
 endp
 
+; ==============================================================
+; main_loop
+;
+; Entry point for the editor session:
+;   1. Clears the screen and prompts for a filename.
+;   2. Opens the file and reads its content into the buffer.
+;   3. Renders the initial screen.
+;   4. Enters the keyboard read-dispatch loop.
+;
+; The loop dispatches on the byte returned in AL (ASCII) or AH
+; (extended scan code when AL == 0).
+; ==============================================================
 proc main_loop
-    mov ah, 0 ;clear screen
-    mov al, 3
+    mov ah, 0                 ; BIOS: set video mode
+    mov al, 3                 ; 80x25 colour text -- also clears the screen
     int 10h
-    
+
     call getFile
     call checkfile
-	
-    
-    mov dl, 0ah
+
+    ; Emit a newline so the file read starts below the prompt line.
+    mov dl, 0Ah
     mov ah, 2h
     int 21h
-    
-    call readfile
-	; Note: readfile now initializes cur_line, cur_col, scroll_offset
-	; Render the screen from the lines buffer
-	call render_screen
 
-    mov dh, 1      ; start at row 1
-    mov dl, 0      ; start at column 0
-    
+    call readfile             ; reads, parses, resets state, draws header
+    call render_screen        ; initial full-screen render
+
+    ; Supervisor registers for row/column (kept here for legacy reasons;
+    ; the real state lives in cur_line / cur_col).
+    mov dh, 1                 ; row 1 = first content row
+    mov dl, 0                 ; column 0
+
+    ; ---- Keyboard read-dispatch loop ----------------------------------------
     read_key:
-		mov ah, 00h
-		int 16h
+		mov ah, 00h           ; BIOS: wait for keypress
+		int 16h               ; AL = ASCII code, AH = scan code
 
+		; Dispatch on ASCII first.
 		cmp al, 0
-		je handle_extended
-		cmp al, 08h    ; AL = 08h → backspace ASCII
+		je handle_extended    ; AL = 0 means this is an extended key
+		cmp al, 08h           ; Backspace
 		je handle_backspace
-		cmp al, 0Dh    ; Enter key ASCII
+		cmp al, 0Dh           ; Enter / Return
 		je handle_enter
-		cmp al, 1Bh
+		cmp al, 1Bh           ; Escape -- quit and save
 		je quit
-		cmp al, 13h
+		cmp al, 13h           ; Ctrl+S -- also quit and save
 		je quit
 
-		; Normal printable key
-		; AL = ASCII
+		; Any other printable character falls through to normal insertion.
 		jmp normal
 
+		; ---- Extended key dispatch ------------------------------------------
 		handle_extended:
-			; AH already contains scan code
+			; AH holds the BIOS scan code for non-ASCII keys.
 			cmp ah, 48h
 			je up_arrow
 			cmp ah, 50h
@@ -596,36 +683,49 @@ proc main_loop
 			je left_arrow
 			cmp ah, 4Dh
 			je right_arrow
-			cmp ah, 47h
+			cmp ah, 47h       ; Home key
 			je home
-			cmp ah, 4Fh
+			cmp ah, 4Fh       ; End key
 			je end_key
-			jmp read_key
+			jmp read_key      ; unknown extended key -- ignore
+
+	; ---- Home key -----------------------------------------------------------
 	home:
-			mov [cur_col], 0
-			call update_cursor
-			jmp read_key
+		mov [cur_col], 0      ; jump to column 0 on the current line
+		call update_cursor
+		jmp read_key
+
+	; ---- End key ------------------------------------------------------------
 	end_key:
 		push bx
 		mov bx, [cur_line]
 		shl bx, 1
 		add bx, offset line_lengths
-		cmp [word ptr bx], 80
+		cmp [word ptr bx], 80 ; if line is completely full, cap at column 79
 		jl normal_end
 		mov [cur_col], 79
 		call update_cursor
 		jmp read_key
 		normal_end:
-			movm2m [cur_col], [bx]
+			movm2m [cur_col], [bx]  ; set column to the actual line length
 			pop bx
 			call update_cursor
 			jmp read_key
-		
+
+	; =========================================================================
+	; handle_backspace
+	;
+	; Two cases:
+	;   A. cur_col > 0: delete the character to the left of the cursor,
+	;      shift the remainder of the line left by one, and redraw.
+	;   B. cur_col == 0: merge the current line onto the end of the
+	;      previous line (if their combined length fits in MAX_LINELEN).
+	; =========================================================================
 	handle_backspace:
 		cmp [cur_col], 0
 		je backspace_start_of_line
-		
-		dec [cur_col]             ; Move left to point to the deleted char
+
+		dec [cur_col]             ; the cursor now points at the character to delete
 
 		push ax
 		push bx
@@ -634,66 +734,71 @@ proc main_loop
 		push si
 		push di
 
-		; 1. Calculate chars to shift left
+		; ---- Compute how many characters lie to the right of the gap --------
 		mov bx, [cur_line]
 		shl bx, 1
-		mov cx, [line_lengths + bx]
+		mov cx, [line_lengths + bx]  ; CX = total line length
 		mov ax, [cur_col]
 		sub cx, ax
-		dec cx                  ; CX = line_lengths - cur_col - 1
-		
-		mov ax, [cur_line]
-		mov dx, MAX_LINELEN
-		mul dx
-		add ax, [cur_col]
-		add ax, offset lines
-		mov di, ax              ; DI = dest (deleted char)
-		mov si, ax
-		inc si                  ; SI = src (char after deleted)
-		
+		dec cx                    ; CX = chars to shift (everything after the gap)
+
+		; Compute address of the deleted character slot in lines[].
+		mov ax, [cur_line] 		; ax = current line number
+		mov dx, MAX_LINELEN 	; dx = maximum line length
+		mul dx 					; ax = current line number * maximum line length
+		add ax, [cur_col] 		; ax = current line number * maximum line length + current column number
+		add ax, offset lines 	; ax = current line number * maximum line length + current column number + offset of lines array
+		mov di, ax 				; di = destination (the deleted slot)
+		mov si, ax 				; si = source (first char after the gap) - 1
+		inc si 					; si = source (first char after the gap)
+
 		cmp cx, 0
 		jle skip_bs_shift
 
-		; Shift characters left functionally
+		; Shift the tail of the line one byte to the left (DS:SI -> DS:DI).
 		push cx
 		push es
 		mov ax, ds
 		mov es, ax
-		cld
-		rep movsb
+		cld								; clear direction flag
+		rep movsb						; sets ds:si to ds:di (cx times) with si and di increasing by one
 		pop es
 		pop cx
 
 	skip_bs_shift:
-		; Blank the final char location (DI naturally increments to the gap)
+		; Blank the vacated cell at the end of the line.
+		; After rep movsb, DI already points to the correct position.
 		mov [byte ptr di], ' '
 
-		; Decrement line length
+		; Shrink the recorded line length by one.
 		mov bx, [cur_line]
 		shl bx, 1
 		dec [word ptr line_lengths + bx]
 
-		; 2. Visually shift left and redraw
+		; ---- Redraw the affected portion of the line in video memory --------
+		; Video offset of the cursor position: (cur_line) * 160 + 160 + cur_col * 2
+		; (+160 skips the header row)
 		mov ax, 0B800h
 		mov es, ax
-		
+
 		mov ax, [cur_line]
 		mov dx, 160
 		mul dx
-		add ax, 160             ; Skip header row
-		
+		add ax, 160               ; skip over the header row
+
 		mov bx, [cur_col]
-		shl bx, 1
+		shl bx, 1                 ; word offset within the row
 		add ax, bx
-		mov di, ax              ; DI = video dest
+		mov di, ax                ; DI = video destination
 		mov si, ax
-		add si, 2               ; SI = video src
-		
+		add si, 2                 ; SI = one cell to the right of DI
+
 		cmp cx, 0
 		jle skip_vis_bs_shift
-		
+
 		push cx
 	vis_bs_shift_loop:
+		; Copy each char+attribute pair one cell to the left.
 		mov al, [es:si]
 		mov [es:di], al
 		mov al, [es:si+1]
@@ -702,11 +807,11 @@ proc main_loop
 		add di, 2
 		loop vis_bs_shift_loop
 		pop cx
-		
+
 	skip_vis_bs_shift:
-		; Blank the last visual char
+		; Blank the rightmost cell that was left behind after the shift.
 		mov [byte ptr es:di], ' '
-		mov [byte ptr es:di+1], 07h
+		mov [byte ptr es:di+1], 07h  ; attribute: white on black
 
 		pop di
 		pop si
@@ -714,65 +819,66 @@ proc main_loop
 		pop cx
 		pop bx
 		pop ax
-		
+
 		call update_cursor
 		jmp read_key
 
+	; ---- Backspace at column 0: attempt to join with the line above ---------
 	backspace_start_of_line:
 		cmp [cur_line], 0
-		je backspace_ignore        ; line 0 col 0 do nothing
+		je backspace_ignore       ; already at line 0, col 0 -- nothing to do
 
-		; Get length of prev line
+		; Load the length of the previous line into CX.
 		mov bx, [cur_line]
 		dec bx
 		shl bx, 1
 		mov ax, [line_lengths + bx]
-		mov cx, ax                 ; CX = length of prev line
-		
-		; Get length of current line
+		mov cx, ax                ; CX = prev line length
+
+		; Load the length of the current line into AX.
 		mov bx, [cur_line]
 		shl bx, 1
-		mov ax, [line_lengths + bx] ; AX = length of current line
-		
-		; Check if combination exceeds MAX_LINELEN
+		mov ax, [line_lengths + bx]
+
+		; Reject the join if the combined length would exceed MAX_LINELEN.
 		push ax
 		add ax, cx
 		cmp ax, MAX_LINELEN
 		pop ax
-		ja backspace_ignore        ; Too long to join
-		
-		; Set new cur_col to end of prev line before joining
+		ja backspace_ignore
+
+		; Position the cursor at the end of the previous line.
 		mov [cur_col], cx
 
-		; Copy chars from current line to previous line
+		; Copy the current line's characters onto the end of the previous line.
 		cmp ax, 0
-		je join_empty_line         ; Nothing to copy
+		je join_empty_line        ; current line is empty -- only metadata to update
 
-		push cx                    ; save prev len
-		push ax                    ; save current len
+		push cx                   ; save previous line length
+		push ax                   ; save current line length
 
-		; Source: lines[cur_line * MAX_LINELEN]
+		; Source: start of lines[cur_line]
 		mov ax, [cur_line]
 		mov dx, MAX_LINELEN
 		mul dx
 		add ax, offset lines
 		mov si, ax
 
-		; Dest: lines[(cur_line - 1) * MAX_LINELEN + prev_len]
+		; Destination: lines[cur_line - 1] + prev_len
 		mov ax, [cur_line]
 		dec ax
 		mov dx, MAX_LINELEN
 		mul dx
-		pop dx                     ; restore current len into dx
-		pop cx                     ; restore prev len into cx
-		add ax, cx
+		pop dx                    ; restore current length into DX
+		pop cx                    ; restore previous length into CX
+		add ax, cx                ; offset past the existing chars on the prev line
 		add ax, offset lines
 		mov di, ax
 
 		push cx
 		push dx
-		
-		mov cx, dx
+
+		mov cx, dx                ; CX = number of bytes to copy
 		mov ax, ds
 		mov es, ax
 		rep movsb
@@ -781,28 +887,28 @@ proc main_loop
 		pop cx
 
 	join_empty_line:
-		; Update prev line length
+		; Write the new combined length into line_lengths[cur_line - 1].
 		mov bx, [cur_line]
 		dec bx
 		shl bx, 1
 		mov ax, cx
-		add ax, dx
+		add ax, dx                ; prev_len + current_len
 		mov [line_lengths + bx], ax
 
-		; Shift subsequent lines UP
+		; Shift all lines below cur_line one slot upward.
 		mov ax, [cur_line]
 		inc ax
 		mov cx, [line_count]
 		sub cx, ax
-		jle update_line_count_bs   ; If no lines below, skip shift
+		jle update_line_count_bs  ; no lines exist below; skip the shift
 
-		; Shift line_lengths array
+		; Slide line_lengths[] entries up by one word.
 		mov bx, [cur_line]
 		shl bx, 1
 		add bx, offset line_lengths
 		mov di, bx
 		mov si, bx
-		add si, 2
+		add si, 2                 ; source is one entry ahead of destination
 
 		push cx
 	shift_lengths_up_loop:
@@ -813,15 +919,15 @@ proc main_loop
 		loop shift_lengths_up_loop
 		pop cx
 
-		; Shift text lines UP
+		; Slide the text rows up by one slot (each slot is MAX_LINELEN bytes).
 		mov ax, [cur_line]
 		mov dx, MAX_LINELEN
 		mul dx
 		add ax, offset lines
-		mov di, ax
+		mov di, ax                ; destination = cur_line's slot
 		mov si, ax
-		add si, MAX_LINELEN
-		
+		add si, MAX_LINELEN       ; source = (cur_line + 1)'s slot
+
 		mov ax, ds
 		mov es, ax
 
@@ -829,21 +935,21 @@ proc main_loop
 		push cx
 		push si
 		push di
-		
-		mov cx, MAX_LINELEN / 2
+
+		mov cx, MAX_LINELEN / 2   ; move MAX_LINELEN bytes as words
 		rep movsw
-		
+
 		pop di
 		pop si
 		pop cx
-		add si, MAX_LINELEN
+		add si, MAX_LINELEN       ; advance both pointers by one row
 		add di, MAX_LINELEN
 		loop shift_text_up_loop
 
 	update_line_count_bs:
 		dec [line_count]
 
-		; Clear the last line that was shifted
+		; Zero-fill the last slot that was vacated by the upward shift.
 		mov ax, [line_count]
 		mov dx, MAX_LINELEN
 		mul dx
@@ -851,12 +957,11 @@ proc main_loop
 		mov di, ax
 		mov cx, MAX_LINELEN / 2
 		xor ax, ax
-		rep stosw
+		rep stosw                 ; clear MAX_LINELEN bytes with zero words
 
-		; Update cur_line
 		dec [cur_line]
 
-		; Scroll adjust if cur_line is above viewport
+		; Scroll the viewport up if the new cur_line is above the top row.
 		mov ax, [scroll_offset]
 		cmp [cur_line], ax
 		jae redraw_screen_bs
@@ -871,56 +976,70 @@ proc main_loop
 	backspace_ignore:
 		jmp read_key
 
+	; =========================================================================
+	; handle_enter
+	;
+	; Inserts a newline at the cursor:
+	;   1. Shifts all lines below cur_line one slot down.
+	;   2. Splits the current line at cur_col: characters from
+	;      cur_col onward move to the new line (cur_line + 1).
+	;   3. Updates line_lengths[] for both halves.
+	;   4. Updates cur_line and cur_col, scrolls if needed.
+	;
+	; Does nothing if line_count has already reached MAX_LINES.
+	; =========================================================================
 	handle_enter:
 		mov ax, [line_count]
 		cmp ax, MAX_LINES
-		jae enter_done
+		jae enter_done            ; buffer is full; silently ignore the keypress
 
+		; CX = number of lines that need to shift down (lines after cur_line).
 		mov cx, [line_count]
 		sub cx, [cur_line]
 		dec cx
 		jl split_current_line_only
 		jz split_current_line_only
 
-		; Shift line_lengths array
+		; ---- Shift line_lengths[] down by one --------------------------------
+		; Iterate from the last entry backwards so we don't overwrite source data.
 		mov bx, [line_count]
 		dec bx
 		shl bx, 1
 		add bx, offset line_lengths
-		
+
 		push cx
 	shift_lengths_loop:
 		mov ax, [bx]
-		mov [bx + 2], ax
+		mov [bx + 2], ax          ; copy entry[i] to entry[i+1]
 		sub bx, 2
 		loop shift_lengths_loop
 		pop cx
 
-		; Shift text lines
+		; ---- Shift text lines[] down by one ---------------------------------
 		mov ax, [line_count]
 		dec ax
 		mov dx, MAX_LINELEN
 		mul dx
 		add ax, offset lines
-		mov si, ax
+		mov si, ax                ; source = last current line
 		mov di, ax
-		add di, MAX_LINELEN
+		add di, MAX_LINELEN       ; destination = one slot below
 
 		mov ax, ds
-		mov es, ax  ; ensure es=ds for rep movsw
-		
+		mov es, ax                ; ensure ES = DS for rep movsw
+
 	shift_text_lines_loop:
 		push cx
 		push si
 		push di
-		
+
 		mov cx, MAX_LINELEN / 2
-		rep movsw
-		
+		rep movsw                 ; copy one full line (word-sized moves)
+
 		pop di
 		pop si
 		pop cx
-		sub si, MAX_LINELEN
+		sub si, MAX_LINELEN       ; walk both pointers one row upward
 		sub di, MAX_LINELEN
 		loop shift_text_lines_loop
 
@@ -928,7 +1047,7 @@ proc main_loop
 		mov ax, ds
 		mov es, ax
 
-		; Clear the new line (cur_line + 1)
+		; Zero-fill the new line slot (cur_line + 1) before copying into it.
 		mov ax, [cur_line]
 		inc ax
 		mov dx, MAX_LINELEN
@@ -937,33 +1056,39 @@ proc main_loop
 		mov di, ax
 		mov cx, MAX_LINELEN / 2
 		xor ax, ax
-		rep stosw       ; clears MAX_LINELEN bytes at new line with 0
+		rep stosw
 
+		; Compute the number of characters that belong on the new line:
+		;   new_line_len = line_lengths[cur_line] - cur_col
 		mov bx, [cur_line]
 		shl bx, 1
 		mov cx, [line_lengths + bx]
 		sub cx, [cur_col]
 
+		; Guard: if cur_col was beyond the line length, treat new_line_len as 0.
 		mov ax, cx
 		cmp ax, 0
 		jge set_new_length
 		xor ax, ax
 		mov cx, 0
 	set_new_length:
+		; Record the length of the new line (cur_line + 1).
 		mov bx, [cur_line]
 		inc bx
 		shl bx, 1
 		mov [line_lengths + bx], ax
 
+		; Truncate the current line to cur_col characters.
 		mov ax, [cur_col]
 		mov bx, [cur_line]
 		shl bx, 1
 		mov [line_lengths + bx], ax
 
 		cmp cx, 0
-		jle finalize_enter
+		jle finalize_enter        ; nothing to copy to the new line
 
-		; Copy Characters
+		; ---- Copy tail characters to the new line ---------------------------
+		; Source: lines[cur_line * MAX_LINELEN + cur_col]
 		mov ax, [cur_line]
 		mov dx, MAX_LINELEN
 		mul dx
@@ -971,6 +1096,7 @@ proc main_loop
 		add ax, offset lines
 		mov si, ax
 
+		; Destination: lines[(cur_line + 1) * MAX_LINELEN]
 		mov ax, [cur_line]
 		inc ax
 		mov dx, MAX_LINELEN
@@ -981,7 +1107,7 @@ proc main_loop
 	copy_split_loop:
 		mov al, [si]
 		mov [di], al
-		mov [byte ptr si], 0 ; Clear old char
+		mov [byte ptr si], 0      ; clear the character from the old line's tail
 		inc si
 		inc di
 		loop copy_split_loop
@@ -989,8 +1115,9 @@ proc main_loop
 	finalize_enter:
 		inc [line_count]
 		inc [cur_line]
-		mov [cur_col], 0
+		mov [cur_col], 0          ; cursor goes to the start of the new line
 
+		; Scroll down one row if the new cur_line is below the visible area.
 		mov ax, [scroll_offset]
 		add ax, 23
 		cmp [cur_line], ax
@@ -1006,101 +1133,116 @@ proc main_loop
 		jmp read_key
 
 	enter_done:
-		jmp read_key
-		
+		jmp read_key              ; MAX_LINES reached -- ignore the keypress
+
+	; =========================================================================
+	; normal  (printable character insertion)
+	;
+	; Inserts the character in AL at the current cursor position:
+	;   1. Shifts all characters from cur_col to end-of-line one
+	;      byte to the right to make room.
+	;   2. Writes the new character at cur_col.
+	;   3. Redraws everything from cur_col to the new end-of-line
+	;      in video memory.
+	;   4. Advances cur_col by one.
+	;
+	; Silently ignores the keypress if the line is already full
+	; (line_length == MAX_LINELEN).
+	; =========================================================================
 	normal:
 		push cx
 		push bx
 		push ax
 		push si
 		push di
-		
+
 		mov bx, [cur_line]
 		shl bx, 1
-		mov cx, [line_lengths+bx]
-		
-		; Ensure we don't exceed MAX_LINELEN
+		mov cx, [line_lengths+bx]  ; CX = current (old) line length
+
+		; Reject input if the line is already at its maximum capacity.
 		cmp cx, MAX_LINELEN
 		jae normal_done_full
-		
-		inc [word ptr line_lengths+bx] ; increment the line length
 
-		; Calculate offset of the end of the current line
+		inc [word ptr line_lengths+bx] ; the line will grow by one character
+
+		; Compute the address of the byte one past the current end of the line.
 		mov ax, [cur_line]
 		mov dx, MAX_LINELEN
 		mul dx
-		add ax, cx             ; CX is the old line length
+		add ax, cx                 ; + old length (= offset of the last char + 1)
 		add ax, offset lines
-		mov di, ax             ; DI points to end of line + 1 (where the last char should move)
+		mov di, ax                 ; DI = target for the rightmost character
 		mov si, ax
-		dec si                 ; SI points to the last actual char of the line
-		
-		mov dx, cx             ; DX = old line length
-		sub dx, [cur_col]      ; DX = number of chars to shift
-		
-		cmp dx, 0
-		jle skip_func_shift    ; if cur_col >= old line length, no shifting needed
+		dec si                     ; SI = last actual character in the line
 
-		push cx                ; save line length
-		mov cx, dx             ; CX = count to shift
-		
-		; Shift chars right (functionally)
-		; Need to iterate backwards so rep movsb requires STD
+		; DX = number of characters that need to shift rightward.
+		mov dx, cx
+		sub dx, [cur_col]
+
+		cmp dx, 0
+		jle skip_func_shift        ; cursor is at or past end of line; no shift needed
+
+		push cx                    ; save old line length across the shift
+		mov cx, dx                 ; CX = character count to shift
+
+		; Shift characters right using backwards rep movsb (direction flag = 1).
 		push es
 		mov ax, ds
 		mov es, ax
-		std
+		std                        ; set direction flag for backwards copy
 		rep movsb
-		cld
+		cld                        ; restore direction flag to forward
 		pop es
 		pop cx
-		
+
 	skip_func_shift:
-		; Insert the new char functionally
+		; Write the new character at lines[cur_line * MAX_LINELEN + cur_col].
 		mov ax, [cur_line]
 		mov dx, MAX_LINELEN
 		mul dx
 		add ax, [cur_col]
 		add ax, offset lines
 		mov bx, ax
-		
-		; Retrieve the character to insert from stack
-		; Stack: si, di, ax, bx, cx -> ax is [sp+4]
+
+		; Retrieve the saved AL from the stack.
+		; Stack layout at this point (bottom to top): cx, bx, ax, si, di
+		; AL is the low byte of the saved AX, located 4 bytes above SP.
 		mov bp, sp
-		mov al, [bp+4] 
+		mov al, [bp+4]
 		mov [byte ptr bx], al
-		
-		; Visually redraw the rest of the line from cur_col onwards
+
+		; ---- Redraw from cur_col to the new end of line in video memory -----
+		; Video address: (cur_line * 160 + 160) + cur_col * 2
 		mov ax, 0B800h
 		mov es, ax
-		
+
 		mov ax, [cur_line]
 		mov dx, 160
 		mul dx
-		add ax, 160             ; Skip header row
+		add ax, 160               ; skip the header row
 		mov bx, [cur_col]
 		shl bx, 1
 		add ax, bx
-		mov di, ax              ; DI = video memory destination
-		
+		mov di, ax                ; DI = video destination
+
 		mov ax, [cur_line]
 		mov dx, MAX_LINELEN
 		mul dx
 		add ax, [cur_col]
 		add ax, offset lines
-		mov si, ax              ; SI = lines array source
+		mov si, ax                ; SI = lines[] source
 
-		; Calculate how many characters to redraw: (old line length + 1) - cur_col
-		mov cx, dx              ; DX has old len - cur_col ?? Wait no, let's recalculate
+		; CX = new line length - cur_col = number of characters to redraw.
 		mov bx, [cur_line]
 		shl bx, 1
-		mov cx, [line_lengths+bx] ; CX = new line length
-		sub cx, [cur_col]       ; CX = number of chars to redraw
-		
+		mov cx, [line_lengths+bx]
+		sub cx, [cur_col]
+
 	redraw_vis_loop:
 		mov al, [si]
 		mov [es:di], al
-		mov [byte ptr es:di+1], 07h
+		mov [byte ptr es:di+1], 07h  ; attribute: white on black
 		inc si
 		add di, 2
 		loop redraw_vis_loop
@@ -1115,13 +1257,15 @@ proc main_loop
 		jmp update_cursor_pos
 
 	normal_done_full:
+		; Line full -- discard the keystroke and return to the read loop.
 		pop di
 		pop si
 		pop ax
 		pop bx
 		pop cx
 		jmp read_key
-		
+
+	; ---- Duplicate scan-code dispatch (kept for legacy compatibility) --------
 	special_keys:
 		cmp ah, 48h
 		je up_arrow
@@ -1133,37 +1277,36 @@ proc main_loop
 		je right_arrow
 		cmp al, 13h
 		je quit
-		
+		jmp read_key
 
- 
-    jmp read_key
-    
+	; =========================================================================
+	; up_arrow
+	;
+	; Moves cur_line up by one.  If cur_col exceeds the length of the
+	; target line, it is snapped back to that line's end.  Scrolls the
+	; viewport up by one row if necessary.
+	; =========================================================================
     up_arrow:
-    ; 1. Check if we are already at the top (line 0)
+    ; Guard: do nothing if we are already on the first line.
     cmp [cur_line], 0
-    je read_key             ; If at the first line, do nothing
+    je read_key
 
-    ; 2. Move one line up
     dec [cur_line]
 
-    ; 3. Get the length of the NEW line we just entered
+    ; If cur_col is past the end of the new line, snap it to line end.
     mov bx, [cur_line]
-    shl bx, 1               ; Word-array index (BX * 2)
-    mov ax, [line_lengths+bx] ; AX = length of the line above
-
-    ; 4. Check if current column exceeds the new line's length
+    shl bx, 1                   ; word-array index
+    mov ax, [line_lengths+bx]
     cmp [cur_col], ax
-    jbe skip_col_upd_up     ; If cur_col <= line length, keep it
-    mov [cur_col], ax       ; Else, snap to the end of the line
+    jbe skip_col_upd_up
+    mov [cur_col], ax
 
 	skip_col_upd_up:
-		; 5. Handle Viewport Scrolling (Moving up)
-		; If the new line is above the current scroll_offset, we need to scroll up
+		; Scroll the viewport up if cur_line has moved above the top edge.
 		mov ax, [scroll_offset]
 		cmp [cur_line], ax
-		jb scroll_up            ; If cur_line < scroll_offset, trigger scroll up
+		jb scroll_up
 
-    ; 6. Update visual cursor and return
     call update_cursor
     jmp read_key
 
@@ -1171,37 +1314,38 @@ proc main_loop
 		dec [scroll_offset]
 		call render_screen
 		jmp read_key
-		
+
+	; =========================================================================
+	; down_arrow
+	;
+	; Moves cur_line down by one.  Snaps cur_col if needed.
+	; Scrolls the viewport down if the cursor moves past the bottom edge.
+	; =========================================================================
     down_arrow:
-    ; 1. Check if we are already at the last line in the buffer
+    ; Guard: do nothing if we are already on the last line.
     mov ax, [line_count]
     dec ax
     cmp [cur_line], ax
-    je read_key             ; If current line == last index, do nothing
+    je read_key
 
-    ; 2. Move to the next line
     inc [cur_line]
 
-    ; 3. Get the length of the NEW current line
+    ; Snap cur_col if it exceeds the new line's length.
     mov bx, [cur_line]
-    shl bx, 1               ; Multiply by 2 for word-array indexing
-    mov ax, [line_lengths+bx] ; AX = actual character count of the new line
-
-    ; 4. Check if our horizontal position exceeds the new line's length
-    ; If cur_col is further right than the text on this line, snap it back
+    shl bx, 1
+    mov ax, [line_lengths+bx]
     cmp [cur_col], ax
-    jbe skip_col_upd        ; If cur_col <= line length, keep current column
-    mov [cur_col], ax       ; Else, set column to line length (end of line)
+    jbe skip_col_upd
+    mov [cur_col], ax
 
 	skip_col_upd:
-		; 5. Handle Viewport Scrolling
-		; Check if the new cursor position is below the current screen (24 lines visible)
+		; Scroll the viewport down if cur_line is now below the bottom edge.
+		; The viewport shows 23 content rows (rows 1-23).
 		mov ax, [scroll_offset]
-		add ax, 23              ; Last visible row on screen (0-23)
+		add ax, 23
 		cmp [cur_line], ax
-		ja scroll_down          ; If cursor is below viewport, trigger scroll
+		ja scroll_down
 
-    ; 6. Refresh cursor position on screen
     call update_cursor
     jmp read_key
 
@@ -1209,48 +1353,60 @@ proc main_loop
 		inc [scroll_offset]
 		call render_screen
 		jmp read_key
-		
+
+	; =========================================================================
+	; left_arrow
+	;
+	; Moves the cursor one character to the left.
+	; If already at column 0, wraps to the end of the previous line.
+	; Does nothing if at line 0, column 0.
+	; =========================================================================
     left_arrow:
         cmp [cur_col], 0
-        ja notup
+        ja notup                  ; column > 0; simple move left
+
+		; Column is 0 -- try to wrap to the previous line.
 		cmp [cur_line], 0
-		je read_key
-		;; move to previous line ;;
-		
-		;calculate the end of the previous line
-		;/=======================\;
+		je read_key               ; already at the very first position; ignore
+
+		; Move up and set the column to the end of the previous line.
 		dec [cur_line]
 		mov bx, offset line_lengths
 		push [cur_line]
-		shl [cur_line], 1 ;multiply (shift bits left by one) for word-array indexing
-		add bx, [cur_line] ;add the offset to get the address of the line length for the needed line
-		;\=======================/;
-		movm2m [cur_col], [bx] 		;set column to the end of the previous line
-		pop [cur_line] ;restore line value to the correct one
+		shl [cur_line], 1         ; word-array index
+		add bx, [cur_line]
+		movm2m [cur_col], [bx]    ; cur_col = line_lengths[cur_line]
+		pop [cur_line]            ; restore the non-doubled value
 		jmp update_cursor_pos
 
-		;; case for just moving left ;;
+		; Simple left move (no wrap needed).
     notup:
         dec [cur_col]
 		jmp update_cursor_pos
-		
+
+	; =========================================================================
+	; right_arrow
+	;
+	; Moves the cursor one character to the right.
+	; If already at the end of the line, wraps to the start of the next line.
+	; Does nothing if at the last line's end.
+	; =========================================================================
     right_arrow:
-        ; 1. Get current line length
+        ; Load the current line's length.
         mov bx, [cur_line]
         shl bx, 1
         mov ax, [line_lengths + bx]
 
-        ; 2. Check if we are at the end of the current line
+        ; If cur_col < line_length, just move right within the same line.
         cmp [cur_col], ax
         jb move_right_same_line
 
-        ; 3. If at the end, try to wrap to the next line
+        ; At the end of the line -- try to wrap to the start of the next line.
         mov ax, [line_count]
         dec ax
         cmp [cur_line], ax
-        jae read_key             ; Already at the last line, nowhere to go right
+        jae read_key             ; already on the last line; nowhere to go
 
-        ;; Move to start of next line ;;
         inc [cur_line]
         mov [cur_col], 0
         jmp update_cursor_pos
@@ -1258,67 +1414,86 @@ proc main_loop
     move_right_same_line:
         inc [cur_col]
         jmp update_cursor_pos
-		
+
+; =========================================================================
+; update_cursor_pos  (shared tail for arrow key handlers)
+;
+; Recalculates scroll_offset if cur_line has moved outside the viewport,
+; clamps cur_col to the current line's length, then calls update_cursor.
+; =========================================================================
 update_cursor_pos:
-		; Check if need to scroll
+		; Is cur_line above the viewport?
 		mov ax, [cur_line]
 		cmp ax, [scroll_offset]
 		jb cursor_left_of_viewport
+
+		; Is cur_line below the viewport?
 		mov ax, [scroll_offset]
 		add ax, 23
 		cmp [cur_line], ax
 		ja cursor_right_of_viewport
-		; Within viewport - just update cursor
+
+		; cur_line is within the viewport -- clamp cur_col and update.
 		mov ax, [cur_line]
-        shl ax, 1 ; multiply by 2 (shift all bits left by one)
+        shl ax, 1                 ; word-array index
         mov bx, ax
         mov ax, [line_lengths+bx]
 		cmp [cur_col], ax
 		jna upd
-		mov [cur_col], ax
+		mov [cur_col], ax         ; snap column to line end
 	upd:
 		call update_cursor
 		jmp read_key
+
 cursor_left_of_viewport:
+		; cur_line scrolled above the top; reset scroll_offset to 0.
 		mov [scroll_offset], 0
 		call render_screen
 		jmp read_key
+
 cursor_right_of_viewport:
+		; cur_line scrolled below the bottom; recompute scroll_offset.
 		mov ax, [cur_line]
 		sub ax, 23
 		mov [scroll_offset], ax
 		call render_screen
 		jmp read_key
-		
+
+	; =========================================================================
+	; quit
+	;
+	; Saves the buffer to disk, clears the screen, and terminates
+	; the program via DOS INT 21h / 4Ch.
+	; =========================================================================
 	quit:
-		call save_file
-		; clear screen
+		call save_file            ; flush buffer to disk before exit
+
+		; Clear the display.
 		mov ah, 0
 		mov al, 3
 		int 10h
 
-		; move cursor to top-left
+		; Home the cursor to (0, 0).
 		mov dh, 0
 		mov dl, 0
 		goto_pos dh, dl
 
-		; exit program properly
+		; Clean program exit.
 		mov ax, 4C00h
 		int 21h
-		
+
     ret
 endp
+
+; ==============================================================
+; Program entry point
+; ==============================================================
 start:
 	mov ax, @data
 	mov ds, ax
-	
+
 	call main_loop
-	;mov ah, 02h
-    ;xor bh, bh
-    ;mov dh, 1
-    ;xor dl, dl
-    ;int 10h
-	
+
 exit:
 	mov ax, 4c00h
 	int 21h
