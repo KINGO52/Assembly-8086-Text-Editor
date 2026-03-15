@@ -19,7 +19,7 @@ A text editor written in 8086 Assembly (TASM) targeting real-mode DOS. It operat
 ---
 
 ---
-##Limits
+## Limits
 - Files With more Than 80 chars per line will have chars that are out of bounds not load and be deleted on saving
 
 ---
