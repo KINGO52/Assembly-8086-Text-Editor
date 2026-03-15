@@ -63,6 +63,7 @@ TLINK editor.obj
 
 Run `EDITOR.EXE` in a DOS environment (DOSBox recommended).
 
+If you want there is a relases page with pre-built versions
 ---
 
 ## Project Structure
