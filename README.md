@@ -16,6 +16,7 @@ A text editor written in 8086 Assembly (TASM) targeting real-mode DOS. It operat
 - **Viewport Scrolling** — Displays 23 lines of content at a time. The viewport scrolls automatically when the cursor moves above or below the visible area.
 - **Header Row** — Row 0 permanently shows `Alon's File Editor - Current File: <filename>`.
 
+---
 ##Limits
 - Files With more Than 80 chars per line will have chars that are out of bounds not load and be deleted on saving
 
