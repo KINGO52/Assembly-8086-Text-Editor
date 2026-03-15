@@ -71,3 +71,6 @@ Run `EDITOR.EXE` in a DOS environment (DOSBox recommended).
 |--------------|------------------------------------------|
 | `editor.asm` | Full source — data, macros, and all procs |
 | `README.md`  | This file                                |
+
+
+* This is currently the same as patch 4 for previous (not fully functioning versions) check other trees
