@@ -17,6 +17,8 @@ A text editor written in 8086 Assembly (TASM) targeting real-mode DOS. It operat
 - **Header Row** — Row 0 permanently shows `Alon's File Editor - Current File: <filename>`.
 
 ---
+
+---
 ##Limits
 - Files With more Than 80 chars per line will have chars that are out of bounds not load and be deleted on saving
 
