@@ -761,7 +761,7 @@ proc main_loop
 		mov ax, ds
 		mov es, ax
 		cld								; clear direction flag
-		rep movsb						; sets ds:si to ds:di (cx times) with si and di increasing by one
+		rep movsb						; sets ds:si to ds:di (usually es:di in this case it is the same as ds:di because es = ds) cx times with si and di increasing by one
 		pop es
 		pop cx
 
