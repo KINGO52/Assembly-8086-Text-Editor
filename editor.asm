@@ -851,6 +851,7 @@ proc main_loop
 		mov [cur_col], cx
 
 		; Copy the current line's characters onto the end of the previous line.
+		xor dx,dx ;by default dx = 0 to prevent errors
 		cmp ax, 0
 		je join_empty_line        ; current line is empty -- only metadata to update
 
