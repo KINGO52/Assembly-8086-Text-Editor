@@ -18,7 +18,7 @@ DATASEG
 	; ---- Core text buffer ---------------------------------------------------
 	; Lines are stored contiguously.  Address of line i:
 	;   offset lines + (i * MAX_LINELEN)
-	lines         db MAX_LINES * MAX_LINELEN dup(0)
+	lines         db (MAX_LINES + 24) * MAX_LINELEN dup(0)
 
 	; Actual character count for each line (word array, 0-based).
 	line_lengths  dw MAX_LINES dup(0)
@@ -79,6 +79,23 @@ macro movm2m op1, op2
 	push ax
 	mov ax, op2
 	mov op1, ax
+	pop ax
+endm
+
+; --------------------------------------------------------------
+; render_page page_num
+; Multiplies page_num by 23 to get the new scroll_offset,
+; updates the state, and calls render_screen to jump by pages.
+; --------------------------------------------------------------
+macro render_page page_num
+	push ax
+	push dx
+	mov ax, page_num
+	mov dx, 23
+	mul dx
+	mov [scroll_offset], ax
+	call render_screen
+	pop dx
 	pop ax
 endm
 
@@ -569,12 +586,17 @@ header_name_done:
 	mov dl, 0Ah
 	int 21h
 
-	; ---- Dump lines buffer to screen (rows 1-23) ----------------------------
-	; TODO: render only the lines visible through scroll_offset.
+	; ---- Dump lines buffer to screen (rows 1-24) ----------------------------
+	; Dynamic offset calculation: lines + (scroll_offset * MAX_LINELEN)
+	mov ax, [scroll_offset]
+	mov dx, MAX_LINELEN
+	mul dx
+	add ax, offset lines
+	mov dx, ax                ; dx now holds the correct starting address for rendering
+
 	mov ah, 40h
 	mov bx, 1                 ; handle 1 = STDOUT
 	mov cx, MAX_LINELEN * 23  ; bytes to write (23 visible content rows)
-	mov dx, offset lines
 	int 21h
 
 	call update_cursor
@@ -585,6 +607,28 @@ header_name_done:
 	pop cx
 	pop bx
 	pop ax
+	ret
+endp
+
+; ==============================================================
+; scroll_up_one_line
+; Decrements scroll_offset and re-renders the screen.
+; Used exclusively by smooth scrolling logic to go up one line.
+; ==============================================================
+proc scroll_up_one_line
+	dec [scroll_offset]
+	call render_screen
+	ret
+endp
+
+; ==============================================================
+; scroll_down_one_line
+; Increments scroll_offset and re-renders the screen.
+; Used exclusively by smooth scrolling logic to go down one line.
+; ==============================================================
+proc scroll_down_one_line
+	inc [scroll_offset]
+	call render_screen
 	ret
 endp
 
@@ -687,6 +731,10 @@ proc main_loop
 			je home
 			cmp ah, 4Fh       ; End key
 			je end_key
+			cmp ah, 49h       ; Page Up
+			je page_up
+			cmp ah, 51h       ; Page Down
+			je page_down
 			jmp read_key      ; unknown extended key -- ignore
 
 	; ---- Home key -----------------------------------------------------------
@@ -711,6 +759,122 @@ proc main_loop
 			pop bx
 			call update_cursor
 			jmp read_key
+
+	; =========================================================================
+	; page_up
+	;
+	; Moves the cursor up by exactly one macro page, keeping visual cursor stable
+	; =========================================================================
+	page_up:
+		; Guard: skip if already on the absolute first page
+		cmp [scroll_offset], 0
+		je pgup_already_top
+
+		; Calculate view_row
+		mov ax, [cur_line]
+		sub ax, [scroll_offset]
+		push ax                   ; save view_row
+
+		; Calculate target page
+		mov ax, [scroll_offset]
+		xor dx, dx
+		mov bx, 23
+		div bx                    ; AX = scroll_offset / 23
+		
+		; Decrement unless division already yielded 0 
+		cmp ax, 0
+		je apply_pgup_render
+		dec ax                    ; Target page
+		
+	apply_pgup_render:
+		; Use the macro to re-render using the target page number in AX
+		render_page ax
+
+		; Calculate new cur_line
+		pop ax
+		add ax, [scroll_offset]
+		mov [cur_line], ax
+
+		; Snap column if necessary
+		mov bx, [cur_line]
+		shl bx, 1
+		mov ax, [line_lengths+bx]
+		cmp [cur_col], ax
+		jbe skip_col_upd_pgup
+		mov [cur_col], ax
+	skip_col_upd_pgup:
+		call update_cursor
+		jmp read_key
+		
+	pgup_already_top:
+		; Clamp cur_line to 0
+		mov [cur_line], 0
+		jmp skip_col_upd_pgup
+
+	; =========================================================================
+	; page_down
+	;
+	; Moves the cursor down by exactly one macro page, keeping visual cursor stable
+	; =========================================================================
+	page_down:
+		; Calculate maximum page
+		mov ax, [line_count]
+		dec ax
+		xor dx, dx
+		mov bx, 23
+		div bx                    ; AX = max page
+		mov cx, ax                ; CX = max page
+
+		; Calculate current page
+		mov ax, [scroll_offset]
+		xor dx, dx
+		div bx
+		
+		; Proceed only if current page < max page
+		cmp ax, cx
+		jae clamp_pgdn_to_eof
+
+		inc ax                    ; Target page
+		
+		; Calculate view_row
+		push ax                   ; Save target page onto stack!
+		mov ax, [cur_line]
+		sub ax, [scroll_offset]
+		mov cx, ax                ; CX = view_row
+		pop ax                    ; Restore target page
+		
+		; Apply the macro
+		render_page ax
+		
+		; Calculate new cur_line = new scroll_offset + view_row
+		mov ax, [scroll_offset]
+		add ax, cx
+		
+		; Ensure cur_line doesn't exceed EOF
+		mov bx, [line_count]
+		cmp ax, bx
+		jae clamp_pgdn_to_eof
+		
+		mov [cur_line], ax
+		jmp snap_col_pgdn
+
+	clamp_pgdn_to_eof:
+		; Snap to the end of the file
+		mov ax, [line_count]
+		dec ax
+		mov [cur_line], ax
+		
+	snap_col_pgdn:
+		; Snap column if necessary
+		mov bx, [cur_line]
+		shl bx, 1
+		mov ax, [line_lengths+bx]
+		cmp [cur_col], ax
+		jbe skip_col_upd_pgdn
+		mov [cur_col], ax
+	skip_col_upd_pgdn:
+		call update_cursor
+		jmp read_key
 
 	; =========================================================================
 	; handle_backspace
@@ -776,12 +940,13 @@ proc main_loop
 		dec [word ptr line_lengths + bx]
 
 		; ---- Redraw the affected portion of the line in video memory --------
-		; Video offset of the cursor position: (cur_line) * 160 + 160 + cur_col * 2
+		; Video offset of the cursor position: (cur_line - scroll_offset) * 160 + 160 + cur_col * 2
 		; (+160 skips the header row)
 		mov ax, 0B800h
 		mov es, ax
 
 		mov ax, [cur_line]
+		sub ax, [scroll_offset]
 		mov dx, 160
 		mul dx
 		add ax, 160               ; skip over the header row
@@ -1120,15 +1285,14 @@ proc main_loop
 
 		; Scroll down one row if the new cur_line is below the visible area.
 		mov ax, [scroll_offset]
-		add ax, 23
+		add ax, 22
 		cmp [cur_line], ax
 		ja scroll_down_ent
 		call render_screen
 		jmp read_key_enter_done
 
 	scroll_down_ent:
-		inc [scroll_offset]
-		call render_screen
+		call scroll_down_one_line
 	read_key_enter_done:
 		call update_cursor
 		jmp read_key
@@ -1214,11 +1378,12 @@ proc main_loop
 		mov [byte ptr bx], al
 
 		; ---- Redraw from cur_col to the new end of line in video memory -----
-		; Video address: (cur_line * 160 + 160) + cur_col * 2
+		; Video address: (cur_line - scroll_offset) * 160 + 160 + cur_col * 2
 		mov ax, 0B800h
 		mov es, ax
 
 		mov ax, [cur_line]
+		sub ax, [scroll_offset]
 		mov dx, 160
 		mul dx
 		add ax, 160               ; skip the header row
@@ -1276,6 +1441,10 @@ proc main_loop
 		je left_arrow
 		cmp ah, 4Dh
 		je right_arrow
+		cmp ah, 49h       ; Page Up
+		je page_up
+		cmp ah, 51h       ; Page Down
+		je page_down
 		cmp al, 13h
 		je quit
 		jmp read_key
@@ -1312,8 +1481,7 @@ proc main_loop
     jmp read_key
 
 	scroll_up:
-		dec [scroll_offset]
-		call render_screen
+		call scroll_up_one_line
 		jmp read_key
 
 	; =========================================================================
@@ -1343,7 +1511,7 @@ proc main_loop
 		; Scroll the viewport down if cur_line is now below the bottom edge.
 		; The viewport shows 23 content rows (rows 1-23).
 		mov ax, [scroll_offset]
-		add ax, 23
+		add ax, 22
 		cmp [cur_line], ax
 		ja scroll_down
 
@@ -1351,8 +1519,7 @@ proc main_loop
     jmp read_key
 
 	scroll_down:
-		inc [scroll_offset]
-		call render_screen
+		call scroll_down_one_line
 		jmp read_key
 
 	; =========================================================================
@@ -1430,7 +1597,7 @@ update_cursor_pos:
 
 		; Is cur_line below the viewport?
 		mov ax, [scroll_offset]
-		add ax, 23
+		add ax, 22
 		cmp [cur_line], ax
 		ja cursor_right_of_viewport
 
@@ -1447,15 +1614,16 @@ update_cursor_pos:
 		jmp read_key
 
 cursor_left_of_viewport:
-		; cur_line scrolled above the top; reset scroll_offset to 0.
-		mov [scroll_offset], 0
+		; cur_line scrolled above the top; update scroll_offset to current line.
+		mov ax, [cur_line]
+		mov [scroll_offset], ax
 		call render_screen
 		jmp read_key
 
 cursor_right_of_viewport:
 		; cur_line scrolled below the bottom; recompute scroll_offset.
 		mov ax, [cur_line]
-		sub ax, 23
+		sub ax, 22
 		mov [scroll_offset], ax
 		call render_screen
 		jmp read_key

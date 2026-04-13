@@ -12,8 +12,9 @@ A text editor written in 8086 Assembly (TASM) targeting real-mode DOS. It operat
 - **Backspace** — Mid-line backspace shifts trailing characters left using `rep movsb`. Backspacing at column 0 joins the current line to the end of the previous one, provided the combined length doesn't exceed `MAX_LINELEN`.
 - **Enter / Line Splitting** — Splits the active line at the cursor, moving trailing characters to a new line below it and shifting all subsequent lines down.
 - **Arrow Key Navigation** — Full support for `↑`, `↓`, `←`, `→` with column clamping when moving between lines of different lengths. Left/right arrow wraps across line boundaries.
+- **Page Up / Page Down** — Jumps the entire viewport and cursor strictly by 23-line pages using a mathematical `render_page` macro.
 - **Home / End Keys** — `Home` snaps to column 0; `End` snaps to the last character of the current line (clamped to column 79 max).
-- **Viewport Scrolling** — Displays 23 lines of content at a time. The viewport scrolls automatically when the cursor moves above or below the visible area.
+- **Viewport Scrolling** — Displays exactly 23 lines of content at a time without triggering terminal boundaries. The viewport smooth-scrolls line-by-line automatically using dedicated `scroll_up_one_line`/`scroll_down_one_line` procedures.
 - **Header Row** — Row 0 permanently shows `Alon's File Editor - Current File: <filename>`.
 
 ---
@@ -27,6 +28,7 @@ A text editor written in 8086 Assembly (TASM) targeting real-mode DOS. It operat
 | `Enter`     | Split line at cursor                         |
 | `↑` / `↓`  | Move cursor up / down one line               |
 | `←` / `→`  | Move cursor left / right (wraps lines)       |
+| `Page Up` / `Page Down` | Jump up / down one full page (23 lines)  |
 | `Home`      | Move to start of line                        |
 | `End`       | Move to end of line                          |
 | `Esc`       | Save and quit                                |
