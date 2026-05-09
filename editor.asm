@@ -1,11 +1,6 @@
 ; ==============================================================
 ; editor.asm  --  8086 Text Editor
 ; ==============================================================
-; Ongoing work:
-;   - Finding and patching bugs in the code
-;   - Auto-save every AUTOSAVE_LIMIT edits to a temp file
-; ==============================================================
-
 JUMPS
 IDEAL
 MODEL small
@@ -33,14 +28,6 @@ DATASEG
 
 	; Index of the buffer line shown on screen row 1 (top of viewport).
 	scroll_offset dw 0
-
-	; ---- File / save state --------------------------------------------------
-	file_dirty    db 0            ; 1 = buffer has unsaved changes, 0 = clean
-	edit_counter  db 0            ; Counts edits since the last autosave
-	AUTOSAVE_LIMIT equ 10         ; Trigger autosave after this many edits
-
-	; Null-terminated path for the temporary/backup file written on each save.
-	temp_filename db 64 dup(0)
 
 	; ---- UI strings ---------------------------------------------------------
 	msg         db 'Enter filname (including file extension): $'
@@ -269,7 +256,7 @@ parse_char:
 
     ; Write AL into lines[BX * MAX_LINELEN + DI].
     ; BX is the line index; borrow it as a pointer, then restore it.
-    push bx
+    push bx	
     push ax                       ; preserve character while computing address
     mov ax, MAX_LINELEN
     mul bx                        ; AX = line_index * MAX_LINELEN
@@ -455,8 +442,6 @@ proc readfile
     mov [cur_line], ax
     mov [cur_col], ax
     mov [scroll_offset], ax
-    mov [file_dirty], al
-    mov [edit_counter], al
 
     ; Place the hardware cursor at row 1, column 0 (below the header).
     mov ah, 02h
