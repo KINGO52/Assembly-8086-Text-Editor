@@ -29,6 +29,7 @@ DATASEG
 	; ---- Editor state -------------------------------------------------------
 	cur_line      dw 0            ; Cursor: current line index (0-based)
 	cur_col       dw 0            ; Cursor: current column index (0-based)
+	
 
 	; Index of the buffer line shown on screen row 1 (top of viewport).
 	scroll_offset dw 0
@@ -42,19 +43,30 @@ DATASEG
 	temp_filename db 64 dup(0)
 
 	; ---- UI strings ---------------------------------------------------------
-	msg         db 'Enter filname (including file extension) $'
+	msg         db 'Enter filname (including file extension): $'
 	filename    db 64             ; DOS buffered-input max-length byte
 	            db ?              ; Actual length byte (filled by INT 21h / 0Ah)
 	            db 64 dup (?)     ; Character buffer
 	headername  db 65 dup (?)
-	emptyname   db 'you entered nothing...$'
-	erroropening db 'there was an error while opening the file did you perhaps enter the wrong name?$'
+	emptyname   db 'you entered nothing...', 13, 10, '$'
+	erroropening db 'there was an error while opening the file did you perhaps enter the wrong name?', 13, 10, '$'
 	filehandle  dw ?
 	readres     db 4096 dup (?)   ; Raw file read buffer (max 4 096 bytes)
 	lengthr     dw ?              ; Number of bytes returned by the last read
 	header      db 'Alon`s File Editor - Current File: $'
 	char_location dw ?            ; Video-memory offset used during rendering
 	crlf_str    db 0Dh, 0Ah      ; CRLF pair written between lines on save
+	controls1 db 'Any char - Type the char like any standard editor', 13, 10, '$'
+	controls2 db 'Backspace - Delete character to the left / join lines', 13, 10, '$'
+	controls3 db 'Arrows - moving the cursor position', 13, 10, '$'
+	controls4 db 'Page Up / Page Down - Jump up / down one full page (23 lines)', 13, 10, '$'
+	controls5 db 'Home - Move cursor to start of line', 13, 10, '$'
+	controls6 db 'End - Move to end of line', 13, 10, '$'
+	controls7 db 'crtl+S/ Esc - Save the current file in its state, and exit the program', 13, 10, '$'
+	controls8 db 'Press any key to continue...$'
+
+	; ---- misc. --------------------------------------------------------------
+	valid_file_name db 0
 
 CODESEG
 
@@ -107,6 +119,19 @@ endm
 ; [filename+2] is the first character of the entered string.
 ; ==============================================================
 proc getFile
+	; Clear the display.
+	mov ah, 0
+	mov al, 3
+	int 10h
+
+	;clear the invalid name flag
+	mov [valid_file_name], 0
+
+	; Home the cursor to (0, 0).
+	mov dh, 0
+	mov dl, 0
+	goto_pos dh, dl
+	
 	mov dx, offset msg      ; point to the prompt string
 	mov ah, 9h
 	int 21h
@@ -115,6 +140,8 @@ proc getFile
 	mov bx, dx
 	mov ah, 0Ah
 	int 21h
+	
+	
 
 	ret
 endp
@@ -151,13 +178,32 @@ proc checkfile
 
 	; ---- Error paths --------------------------------------------------------
 	erroropen:
+		mov [valid_file_name], 1
+
 		mov dx, offset erroropening
-		mov ah, 9h
+		mov ah, 09h
 		int 21h
+
+		mov ah, 09h
+		mov dx, offset controls8
+		int 21h
+
+		mov ah, 01h
+		int 21h
+
 		jmp endcheckfile
 	invalid_input:
+		mov [valid_file_name], 1
+
 		mov dx, offset emptyname
-		mov ah, 9h
+		mov ah, 09h
+		int 21h
+
+		mov ah, 09h
+		mov dx, offset controls8
+		int 21h
+
+		mov ah, 01h
 		int 21h
 	endcheckfile:
 		ret
@@ -679,9 +725,58 @@ proc main_loop
     mov ah, 0                 ; BIOS: set video mode
     mov al, 3                 ; 80x25 colour text -- also clears the screen
     int 10h
+	
+	; print controls1
+    mov dx, offset controls1
+    mov ah, 09h
+    int 21h
 
+    ; print controls2
+    mov dx, offset controls2
+    mov ah, 09h
+    int 21h
+
+    ; print controls3
+    mov dx, offset controls3
+    mov ah, 09h
+    int 21h
+
+    ; print controls4
+    mov dx, offset controls4
+    mov ah, 09h
+    int 21h
+
+    ; print controls5
+    mov dx, offset controls5
+    mov ah, 09h
+    int 21h
+
+    ; print controls6
+    mov dx, offset controls6
+    mov ah, 09h
+    int 21h
+
+    ; print controls7
+    mov dx, offset controls7
+    mov ah, 09h
+    int 21h
+
+    ; print controls8
+    mov dx, offset controls8
+    mov ah, 09h
+    int 21h
+
+    ; wait for key press
+    mov ah, 00h
+    int 16h
+
+	retry:
     call getFile
     call checkfile
+
+	cmp [valid_file_name], 1
+
+	je retry
 
     ; Emit a newline so the file read starts below the prompt line.
     mov dl, 0Ah
