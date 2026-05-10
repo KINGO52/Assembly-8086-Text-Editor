@@ -34,14 +34,12 @@ DATASEG
 	filename    db 64             ; DOS buffered-input max-length byte
 	            db ?              ; Actual length byte (filled by INT 21h / 0Ah)
 	            db 64 dup (?)     ; Character buffer
-	headername  db 65 dup (?)
 	emptyname   db 'you entered nothing...', 13, 10, '$'
 	erroropening db 'there was an error while opening the file did you perhaps enter the wrong name?', 13, 10, '$'
 	filehandle  dw ?
 	readres     db 4096 dup (?)   ; Raw file read buffer (max 4 096 bytes)
 	lengthr     dw ?              ; Number of bytes returned by the last read
 	header      db 'Alon`s File Editor - Current File: $'
-	char_location dw ?            ; Video-memory offset used during rendering
 	crlf_str    db 0Dh, 0Ah      ; CRLF pair written between lines on save
 	controls1 db 'Any char - Type the char like any standard editor', 13, 10, '$'
 	controls2 db 'Backspace - Delete character to the left / join lines', 13, 10, '$'
@@ -334,56 +332,6 @@ store_count:
 
     pop di
     pop si
-    pop dx
-    pop cx
-    pop bx
-    pop ax
-    ret
-endp
-
-; ==============================================================
-; mark_line_endings
-;
-; Writes a marker byte at position line_lengths[i] in every line
-; (i.e. at the byte immediately after the last character).
-;   AL = 0Ah  -> mark  (used before raw video output)
-;   AL = 0    -> unmark (restores null terminator)
-; ==============================================================
-proc mark_line_endings
-    push ax
-    push bx
-    push cx
-    push dx
-
-    mov dl, al                    ; preserve marker byte; AL will be clobbered
-    xor cx, cx                    ; CX = line index
-
-mark_loop:
-    cmp cx, [line_count]
-    jae mark_done
-
-    ; BX = line_lengths[cx]
-    mov bx, cx
-    shl bx, 1                     ; word-array index
-    mov bx, [line_lengths+bx]     ; BX = length of this line
-    cmp bx, MAX_LINELEN
-    jae skip_mark_write           ; length at or beyond column limit; skip
-
-    ; Compute: &lines[cx * MAX_LINELEN + BX]
-    push bx                       ; save length
-    mov ax, MAX_LINELEN
-    mul cx                        ; AX = cx * MAX_LINELEN
-    pop bx
-    add ax, bx                    ; + column offset (= length)
-    add ax, offset lines          ; + buffer base
-
-    mov bx, ax
-    mov [bx], dl                  ; write the marker byte
-    skip_mark_write:
-    inc cx
-    jmp mark_loop
-
-mark_done:
     pop dx
     pop cx
     pop bx
@@ -1158,8 +1106,7 @@ proc main_loop
 
 		push cx
 	shift_lengths_up_loop:
-		mov ax, [si]
-		mov [di], ax
+		movm2m [di], [si]
 		add si, 2
 		add di, 2
 		loop shift_lengths_up_loop
@@ -1211,8 +1158,7 @@ proc main_loop
 		mov ax, [scroll_offset]
 		cmp [cur_line], ax
 		jae redraw_screen_bs
-		mov ax, [cur_line]
-		mov [scroll_offset], ax
+		movm2m [scroll_offset], [cur_line]
 
 	redraw_screen_bs:
 		call render_screen
@@ -1255,8 +1201,7 @@ proc main_loop
 
 		push cx
 	shift_lengths_loop:
-		mov ax, [bx]
-		mov [bx + 2], ax          ; copy entry[i] to entry[i+1]
+		movm2m [bx + 2], [bx]          ; copy entry[i] to entry[i+1]
 		sub bx, 2
 		loop shift_lengths_loop
 		pop cx
@@ -1511,24 +1456,6 @@ proc main_loop
 		pop cx
 		jmp read_key
 
-	; ---- Duplicate scan-code dispatch (kept for legacy compatibility) --------
-	special_keys:
-		cmp ah, 48h
-		je up_arrow
-		cmp ah, 50h
-		je down_arrow
-		cmp ah, 4Bh
-		je left_arrow
-		cmp ah, 4Dh
-		je right_arrow
-		cmp ah, 49h       ; Page Up
-		je page_up
-		cmp ah, 51h       ; Page Down
-		je page_down
-		cmp al, 13h
-		je quit
-		jmp read_key
-
 	; =========================================================================
 	; up_arrow
 	;
@@ -1555,14 +1482,11 @@ proc main_loop
 		; Scroll the viewport up if cur_line has moved above the top edge.
 		mov ax, [scroll_offset]
 		cmp [cur_line], ax
-		jb scroll_up
+		jb update_cursor_pos
 
     call update_cursor
     jmp read_key
 
-	scroll_up:
-		call scroll_up_one_line
-		jmp read_key
 
 	; =========================================================================
 	; down_arrow
@@ -1593,15 +1517,10 @@ proc main_loop
 		mov ax, [scroll_offset]
 		add ax, 22
 		cmp [cur_line], ax
-		ja scroll_down
+		ja update_cursor_pos
 
     call update_cursor
     jmp read_key
-
-	scroll_down:
-		call scroll_down_one_line
-		jmp read_key
-
 	; =========================================================================
 	; left_arrow
 	;
@@ -1695,8 +1614,7 @@ update_cursor_pos:
 
 cursor_left_of_viewport:
 		; cur_line scrolled above the top; update scroll_offset to current line.
-		mov ax, [cur_line]
-		mov [scroll_offset], ax
+		movm2m [scroll_offset], [cur_line]
 		call render_screen
 		jmp read_key
 
