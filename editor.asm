@@ -58,7 +58,6 @@ CODESEG
 ; --------------------------------------------------------------
 ; goto_pos row, col
 ; Sets the hardware cursor to (row, col) via BIOS INT 10h / 02h.
-; Clobbers: AH, DH, DL  (caller must save if needed)
 ; --------------------------------------------------------------
 macro goto_pos row, col
     mov ah, 02h
@@ -268,14 +267,11 @@ parse_char:
     inc di
     jmp parse_char
 
-handle_cr:
+    handle_cr:
     ; Commit the current line length and advance to the next line.
     push bx
-    mov ax, bx
-    shl ax, 1                     ; word-array index (each entry is 2 bytes)
-    add ax, offset line_lengths
-    mov bx, ax
-    mov [bx], di                  ; line_lengths[line_index] = column count
+    shl bx, 1                     ; line index -> word offset
+    mov [line_lengths + bx], di   ; store length directly
     pop bx
 
     inc bx
@@ -298,11 +294,8 @@ handle_cr:
 handle_lf:
     ; Stand-alone LF: same line-commit logic as CR.
     push bx
-    mov ax, bx
-    shl ax, 1
-    add ax, offset line_lengths
-    mov bx, ax
-    mov [bx], di
+    shl bx, 1
+    mov [line_lengths + bx], di
     pop bx
 
     inc bx
@@ -319,11 +312,8 @@ parse_done:
     je store_count
 
     push bx
-    mov ax, bx
-    shl ax, 1
-    add ax, offset line_lengths
-    mov bx, ax
-    mov [bx], di
+    shl bx, 1
+    mov [line_lengths + bx], di
     pop bx
     inc bx
 
@@ -456,20 +446,21 @@ save_loop:
     pop cx                      ; restore line index
 
 write_newline:
-    ; Omit the trailing newline on the very last line.
+    ; Check if this is the last line. We only write CRLF *between* lines
+    ; to avoid an empty trailing line at the end of the file.
     mov ax, cx
-    inc ax
-    cmp ax, [line_count]
-    jae next_line
+    inc ax                        ; AX = next line index
+    cmp ax, [line_count]          ; Is there another line after this one?
+    jae next_line                 ; If no more lines, skip the newline write
 
-    ; Write the two-byte CRLF sequence.
-    mov ah, 40h
-    mov bx, [filehandle]
-    push cx                     ; preserve line index
-    mov cx, 2
-    mov dx, offset crlf_str
-    int 21h
-    pop cx                      ; restore line index
+    ; Write the CRLF (0Dh, 0Ah) sequence to the file using DOS INT 21h / 40h.
+    mov ah, 40h                   ; AH = 40h (Write to file)
+    mov bx, [filehandle]          ; BX = File handle
+    push cx                       ; Save current line index (CX will be used for byte count)
+    mov cx, 2                     ; CX = 2 bytes (length of crlf_str)
+    mov dx, offset crlf_str       ; DX = Pointer to CRLF data
+    int 21h                       ; Call DOS
+    pop cx                        ; Restore current line index
 
 next_line:
     inc cx
@@ -520,7 +511,7 @@ proc render_screen
 
 	; ---- Set up video segment -----------------------------------------------
 	mov ax, 0B800h
-	mov es, ax
+	mov es, ax					; ES = video memory segment (we can't directly set es's value as a constant, used for later calcs)
 	xor di, di                ; start writing from video offset 0 (row 0, col 0)
 
 	; ---- Render the header string on row 0 ----------------------------------
@@ -528,7 +519,7 @@ proc render_screen
 	mov ah, 07h               ; attribute: white on black
 
 header_loop:
-	lodsb
+	lodsb					; al = [si], si++
 	cmp al, '$'               ; '$' is the DOS string terminator
 	je header_done
 	mov [es:di], al           ; character byte
@@ -1201,7 +1192,10 @@ proc main_loop
 
 		push cx
 	shift_lengths_loop:
-		movm2m [bx + 2], [bx]          ; copy entry[i] to entry[i+1]
+		push ax
+		mov ax, [bx]
+		mov [bx + 2], ax
+		pop ax
 		sub bx, 2
 		loop shift_lengths_loop
 		pop cx
