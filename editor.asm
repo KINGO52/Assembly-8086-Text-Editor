@@ -144,11 +144,11 @@ proc checkfile
 	je invalid_input        ; nothing was typed
 
 	; Build a null-terminated string for DOS file-open (INT 21h / 3Dh).
-	; The buffered-input layout is: [max][len][chars...], so
-	; terminator goes at chars[len] == filename+2+len.
-	lea bx, [filename]
-	add bl, [bx+1]          ; advance BL past the max and len bytes
-	mov [byte ptr bx+2], 0  ; write the null terminator
+	mov bx, offset filename
+	xor ax, ax              ; AX = 0
+	mov al, [bx+1]          ; AL = actual length of the string (1 byte)
+	add bx, ax              ; BX = offset filename + actual length (16-bit safe!)
+	mov [byte ptr bx+2], 0  ; Null-terminate at: filename + 2 + length
 
 	mov dx, offset filename+2  ; DS:DX = null-terminated filename
 	mov al, 0                  ; access mode: read-only
@@ -564,8 +564,8 @@ header_name_done:
 	add ax, offset lines
 	mov dx, ax                ; dx now holds the correct starting address for rendering
 
-	mov ah, 40h
-	mov bx, 1                 ; handle 1 = STDOUT
+	mov ah, 40h					; write to file handle 1 (stdout)
+	mov bx, 1                 ; handle 1 = STDOUT (the screen)
 	mov cx, MAX_LINELEN * 23  ; bytes to write (23 visible content rows)
 	int 21h
 
@@ -789,12 +789,13 @@ proc main_loop
 		cmp [scroll_offset], 0
 		je pgup_already_top
 
-		; Calculate view_row
+		; Calculate view_row (how many rows from the top we are)
+		; view_row = cur_line - scroll_offset(the top line index)
 		mov ax, [cur_line]
 		sub ax, [scroll_offset]
 		push ax                   ; save view_row
 
-		; Calculate target page
+		; Calculate target page (by dividing the current scroll offset by the number of rows per page)
 		mov ax, [scroll_offset]
 		xor dx, dx
 		mov bx, 23
@@ -1607,18 +1608,23 @@ update_cursor_pos:
 		jmp read_key
 
 cursor_left_of_viewport:
-		; cur_line scrolled above the top; update scroll_offset to current line.
+		; The active line is above the visible viewport. Update scroll_offset
+		; to cur_line, aligning the cursor with the very top visible row.
+		; we basically solve for scroll offset here: cur_line - scroll_offset = 0 that means that scroll_offset = cur_line
 		movm2m [scroll_offset], [cur_line]
-		call render_screen
-		jmp read_key
+		call render_screen        ; Redraw viewport to reflect the new scroll window
+		jmp read_key              ; Go back to main input loop
 
 cursor_right_of_viewport:
-		; cur_line scrolled below the bottom; recompute scroll_offset.
+		; The active line is below the visible viewport. Since the editor shows
+		; 23 content rows (0 to 22 relative to scroll_offset), we subtract 22
+		; from cur_line to place the active line exactly at the bottom visible row.
+		; we basically solve for scroll offset here: cur_line - scroll_offset = 22 that means that scroll_offset = cur_line - 22
 		mov ax, [cur_line]
-		sub ax, 22
+		sub ax, 22                ; scroll_offset = cur_line - 22 (aligns active line to row index 22)
 		mov [scroll_offset], ax
-		call render_screen
-		jmp read_key
+		call render_screen        ; Redraw viewport to reflect the new scroll window
+		jmp read_key              ; Go back to main input loop
 
 	; =========================================================================
 	; quit
