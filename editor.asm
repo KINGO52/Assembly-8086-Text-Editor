@@ -31,7 +31,7 @@ DATASEG
 
 	; ---- UI strings ---------------------------------------------------------
 	msg         db 'Enter filname (including file extension): $'
-	filename    db 64             ; DOS buffered-input max-length byte
+	filename    db 63             ; DOS buffered-input max-length byte
 	            db ?              ; Actual length byte (filled by INT 21h / 0Ah)
 	            db 64 dup (?)     ; Character buffer
 	emptyname   db 'you entered nothing...', 13, 10, '$'
@@ -235,7 +235,7 @@ parse_char:
     or cx, cx
     jz handle_eof                 ; all bytes consumed
 
-    lodsb
+    lodsb						  ; al = [si] si++
     dec cx                        ; account for the byte lodsb just advanced SI over
 
     cmp al, 0
@@ -282,7 +282,7 @@ parse_char:
     ; Peek at the next byte to handle CRLF sequences.
     or cx, cx
     jz parse_done                 ; nothing left to peek at
-    lodsb
+    lodsb						  ; al = [si] si++
     dec cx                        ; count the peeked byte
     cmp al, 0Ah                   ; is the next byte LF?
     je parse_char                 ; yes -- discard it and continue
@@ -361,7 +361,7 @@ proc readfile
     int 21h
 
     ; Temporarily terminate the filename with '$' so INT 21h / 09h can print it.
-    lea bx, [filename]
+    mov bx, offset filename
     add bl, [bx+1]            ; BL now points past the length byte
     mov [byte ptr bx+2], '$'
 
@@ -371,7 +371,7 @@ proc readfile
     int 21h
 
     ; Restore the null terminator so the filename remains ASCIIZ.
-    lea bx, [filename]
+    mov bx, offset filename
     add bl, [bx+1]
     mov [byte ptr bx+2], 0
 
@@ -410,10 +410,10 @@ proc save_file
     ; Create (or truncate) the file so we always start with a clean slate.
     mov ah, 3Ch
     mov cx, 0                   ; normal attribute (no read-only, hidden, etc.)
-    mov dx, offset filename+2
+    mov dx, offset filename+2	; skip over the max length and actual length bytes
     int 21h
     jc save_done                ; carry set = create failed; abort gracefully
-    mov [filehandle], ax
+    mov [filehandle], ax		; save the file handle
 
     xor cx, cx                  ; CX = current line index
 
